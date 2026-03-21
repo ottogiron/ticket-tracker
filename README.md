@@ -191,7 +191,7 @@ Ticket headings can use any level from H2 to H6 (`##` through `######`). The par
 
 Sessions are stored as YAML files in `.sessions/` at the repository root. Each session is keyed by its ticket or batch ID.
 
-```
+```text
 .sessions/
   FEAT-1.yaml
   MY-BATCH.yaml
@@ -261,15 +261,15 @@ Or add a Makefile target:
 
 ```makefile
 setup-hooks:
-	mkdir -p .git/hooks
-	ln -sf ../../scripts/hooks/pre-commit .git/hooks/pre-commit
+    mkdir -p .git/hooks
+    ln -sf ../../scripts/hooks/pre-commit .git/hooks/pre-commit
 ```
 
 ## .gitignore
 
 Add to your `.gitignore`:
 
-```
+```text
 .sessions/
 .session
 ```

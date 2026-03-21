@@ -1,8 +1,19 @@
-.PHONY: build test fmt fmt-check clippy verify clean
+.PHONY: build release test fmt fmt-check clippy check clean verify lint-md install
 
+# ── Build ────────────────────────────────────────────────────────────
 build:
 	cargo build
 
+release:
+	cargo build --release
+
+check:
+	cargo check
+
+clean:
+	cargo clean
+
+# ── Quality ──────────────────────────────────────────────────────────
 test:
 	cargo test
 
@@ -15,7 +26,13 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets -- -D warnings
 
-verify: fmt-check clippy test
+lint-md:
+	npx markdownlint-cli2 "**/*.md"
 
-clean:
-	cargo clean
+# ── Quality gate (fmt-check + clippy + test + markdown lint) ─────────
+verify: fmt-check clippy test lint-md
+
+# ── Install ──────────────────────────────────────────────────────────
+install:
+	cargo install --path .
+	@echo "Installed ticket to ~/.cargo/bin/"
