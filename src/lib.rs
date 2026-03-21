@@ -152,10 +152,10 @@ mod tests {
 
     #[test]
     fn test_resolve_repo_root_from_returns_existing_path() {
-        // cargo test always runs inside the project git repo, so the resolved
-        // path must exist on disk.
-        let cwd = std::env::current_dir().expect("get cwd");
-        let root = resolve_repo_root_from(&cwd);
+        // Use the CARGO_MANIFEST_DIR (the directory containing Cargo.toml)
+        // which is stable and always exists — avoids CWD race with other tests.
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = resolve_repo_root_from(&manifest_dir);
         assert!(
             root.exists(),
             "resolve_repo_root_from() returned a non-existent path: {}",
