@@ -117,7 +117,10 @@ ticket note FEAT-1 "Discovered edge case in parser"
 
 ### `--repo-root`
 
-All commands accept `--repo-root <path>` to specify the repository root (defaults to `.`).
+All commands accept `--repo-root <path>` to override the repository root. When
+omitted, the tool auto-detects the main repository root via `git` — this works
+correctly from any subdirectory and from linked git worktrees. Falls back to `.`
+if `git` is unavailable or the current directory is not inside a repository.
 
 ```bash
 ticket status --repo-root /path/to/project
