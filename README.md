@@ -224,7 +224,13 @@ Create `scripts/hooks/pre-commit`:
 #!/bin/bash
 set -e
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+# Resolve main repo root — works in both main checkout and worktrees.
+GIT_COMMON="$(git rev-parse --git-common-dir)"
+if [ "$GIT_COMMON" = ".git" ]; then
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
+else
+    REPO_ROOT="$(cd "$GIT_COMMON/.." && pwd)"
+fi
 SESSION_DIR="$REPO_ROOT/.sessions"
 
 # Check if any valid session exists
