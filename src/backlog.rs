@@ -184,7 +184,7 @@ impl Backlog {
             .ok_or_else(|| format!("Metrics entry not found for ticket {}", ticket_id))?;
 
         let entry = &self.content[entry_start..entry_end];
-        let metric_pattern = format!(r"(?m)^- {}: .*$", regex::escape(metric));
+        let metric_pattern = format!(r"(?m)^- {}:\s*.*$", regex::escape(metric));
         let metric_re = Regex::new(&metric_pattern).map_err(|e| format!("Regex error: {}", e))?;
 
         let new_line = format!("- {}: {}", metric, value);
@@ -427,6 +427,33 @@ mod tests {
         assert!(backlog
             .content
             .contains("- Notes: completed successfully\n\n- Ticket: TEST-2"));
+    }
+
+    #[test]
+    fn test_update_metric_replaces_blank_placeholder_value() {
+        let content = [
+            "## Execution Metrics",
+            "",
+            "- Ticket: TEST-1",
+            "- Start:",
+            "- End:",
+            "",
+        ]
+        .join("\n");
+
+        let mut backlog = Backlog {
+            content,
+            file_path: std::path::PathBuf::from("unused.md"),
+        };
+
+        backlog
+            .update_metric("TEST-1", "Start", "2026-03-29 03:29 UTC")
+            .expect("update start");
+
+        assert!(backlog.content.contains("- Start: 2026-03-29 03:29 UTC"));
+        assert!(!backlog
+            .content
+            .contains("- Start:\n- End:\n- Start: 2026-03-29 03:29 UTC"));
     }
 
     #[test]

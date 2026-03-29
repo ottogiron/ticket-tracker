@@ -30,7 +30,7 @@ Created: 2026-03-29
 - Verification:
   - `make verify`
   - Manual: simulate a session with backlog status `Done` and confirm `ticket reconcile` flags it
-- Status: In Progress
+- Status: Done
 
 ## Tracking Notes
 
@@ -40,8 +40,7 @@ Created: 2026-03-29
 - Owner: otto
 - Complexity: S
 - Risk: Low
-- Start:
-- End:
-- Duration:
-- Notes:
 - Start: 2026-03-29 03:29 UTC
+- End: 2026-03-29 03:40 UTC
+- Duration: 00:10:50
+- Notes:
