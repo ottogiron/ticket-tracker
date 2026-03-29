@@ -121,6 +121,7 @@ enum Commands {
         #[arg(help = "Note to add")]
         note: String,
     },
+    Import,
 }
 
 pub fn run(cli: Cli) -> Result<(), String> {
@@ -148,6 +149,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
             commands::blocked(&repo_root, &ticket_id, &reason)
         }
         Commands::Note { ticket_id, note } => commands::note(&repo_root, &ticket_id, &note),
+        Commands::Import => commands::import(&repo_root),
     }
 }
 

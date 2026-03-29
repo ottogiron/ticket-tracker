@@ -142,6 +142,46 @@ impl Store {
         Ok(())
     }
 
+    /// Upsert a ticket row.  Returns `true` if the row was newly inserted,
+    /// `false` if an existing row was updated.  `created_at` is preserved on
+    /// update so the original import timestamp is not overwritten.
+    pub fn upsert_ticket(&self, ticket: &Ticket) -> Result<bool, String> {
+        let is_new = self.get_ticket(&ticket.ticket_id)?.is_none();
+        self.conn
+            .execute(
+                "INSERT INTO tickets (ticket_id, backlog, title, spec_file, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(ticket_id) DO UPDATE SET
+                     backlog   = excluded.backlog,
+                     title     = excluded.title,
+                     spec_file = excluded.spec_file",
+                params![
+                    ticket.ticket_id,
+                    ticket.backlog,
+                    ticket.title,
+                    ticket.spec_file,
+                    ticket.created_at,
+                ],
+            )
+            .map_err(|e| format!("upsert_ticket failed: {e}"))?;
+        Ok(is_new)
+    }
+
+    /// Return `true` when a note with identical `(ticket_id, kind, body)`
+    /// already exists.  Used by the import command to avoid duplicates.
+    pub fn note_exists(&self, ticket_id: &str, kind: &str, body: &str) -> Result<bool, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM ticket_notes
+                 WHERE ticket_id = ?1 AND kind = ?2 AND body = ?3
+                 LIMIT 1",
+            )
+            .map_err(|e| format!("prepare note_exists: {e}"))?;
+        stmt.exists(params![ticket_id, kind, body])
+            .map_err(|e| format!("note_exists query: {e}"))
+    }
+
     pub fn get_ticket(&self, ticket_id: &str) -> Result<Option<Ticket>, String> {
         let mut stmt = self
             .conn
@@ -766,5 +806,71 @@ mod tests {
             .add_note("FLUX-1", "comment", "b", 3_000_001)
             .expect("note 2");
         assert!(id2 > id1);
+    }
+
+    // ── upsert_ticket ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_upsert_ticket_returns_is_new_on_insert() {
+        let (_dir, store) = make_store();
+        let is_new = store.upsert_ticket(&sample_ticket()).expect("upsert");
+        assert!(is_new, "first upsert should report is_new=true");
+    }
+
+    #[test]
+    fn test_upsert_ticket_returns_false_on_update() {
+        let (_dir, store) = make_store();
+        store.upsert_ticket(&sample_ticket()).expect("first upsert");
+        let is_new = store
+            .upsert_ticket(&sample_ticket())
+            .expect("second upsert");
+        assert!(!is_new, "second upsert should report is_new=false");
+    }
+
+    #[test]
+    fn test_upsert_ticket_preserves_created_at() {
+        let (_dir, store) = make_store();
+        store.upsert_ticket(&sample_ticket()).expect("first upsert");
+        // Second upsert with a later created_at — original must be kept.
+        let updated = Ticket {
+            title: "Changed title".to_string(),
+            created_at: 9_999_999,
+            ..sample_ticket()
+        };
+        store.upsert_ticket(&updated).expect("second upsert");
+        let got = store.get_ticket("FLUX-1").expect("get").expect("some");
+        assert_eq!(
+            got.created_at, 1_000_000,
+            "created_at must not be overwritten"
+        );
+        assert_eq!(got.title, "Changed title", "title should be updated");
+    }
+
+    // ── note_exists ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_note_exists_returns_false_when_absent() {
+        let (_dir, store) = make_store();
+        store.insert_ticket(&sample_ticket()).expect("insert");
+        let exists = store
+            .note_exists("FLUX-1", "note", "anything")
+            .expect("note_exists");
+        assert!(!exists);
+    }
+
+    #[test]
+    fn test_note_exists_returns_true_after_add() {
+        let (_dir, store) = make_store();
+        store.insert_ticket(&sample_ticket()).expect("insert");
+        store
+            .add_note("FLUX-1", "note", "my note", 1_000)
+            .expect("add note");
+        assert!(store
+            .note_exists("FLUX-1", "note", "my note")
+            .expect("exists"));
+        // Different kind — must not match.
+        assert!(!store
+            .note_exists("FLUX-1", "other", "my note")
+            .expect("exists other"));
     }
 }

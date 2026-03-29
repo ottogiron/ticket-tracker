@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `ticket import` command — scans `docs/project/backlog/*.md` and populates SQLite with tickets, statuses, execution metrics, tracking notes, and closure evidence; idempotent and safe to re-run
 - Markdown lint (`markdownlint-cli2`) to `make verify` quality gate
 - `.markdownlint-cli2.jsonc` and `.markdownlintignore` config files
 
