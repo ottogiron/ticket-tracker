@@ -38,18 +38,6 @@ Created: 2026-01-01
   - Tests pass
 - Verification:
   - cargo test
-- Status: Todo
-
-## Execution Metrics
-
-- Ticket: FEAT-1
-- Owner: me
-- Complexity: M
-- Risk: Low
-- Start:
-- End:
-- Duration:
-- Notes:
 EOF
 
 # Start a ticket session
@@ -126,6 +114,17 @@ Adds a timestamped note to the backlog's Tracking Notes section.
 ticket note FEAT-1 "Discovered edge case in parser"
 ```
 
+### `ticket report <id>`
+
+Show a full report for a ticket or batch: status, timestamps, duration, notes, and closure evidence.
+
+```bash
+ticket report FEAT-1              # single ticket
+ticket report --batch MY-BATCH    # all tickets in a batch
+```
+
+Output includes status from `.ticket/state.db`, all notes, and blocker entries.
+
 ### `--repo-root`
 
 All commands accept `--repo-root <path>` to override the repository root. When
@@ -166,23 +165,17 @@ Created: YYYY-MM-DD
   - <criterion>
 - Verification:
   - <command or check>
-- Status: Todo
 
-## Execution Metrics
+## Execution Order
 
-- Ticket: <ID>
-- Owner: <name>
-- Complexity: <S | M | L | XL>
-- Risk: <Low | Medium | High>
-- Start:
-- End:
-- Duration:
-- Notes:
+1. <ID>
+
+## Tracking Notes
 ```
 
 ### Required Ticket Fields
 
-Every ticket section must include these 7 fields (validated by `ticket start`):
+Every ticket section must include these 6 fields (validated by `ticket start`):
 
 | Field | Description |
 |-------|-------------|
@@ -192,7 +185,8 @@ Every ticket section must include these 7 fields (validated by `ticket start`):
 | `Dependencies` | Prerequisite ticket IDs or "None" |
 | `Acceptance criteria` | How to verify success |
 | `Verification` | Specific commands or checks |
-| `Status` | `Todo`, `In Progress`, `Blocked`, or `Done` |
+
+> **Execution state** (status, start time, duration) is stored in SQLite at `.ticket/state.db` — not in the markdown.
 
 ### Heading Levels
 
@@ -200,13 +194,7 @@ Ticket headings can use any level from H2 to H6 (`##` through `######`). The par
 
 ## Session Management
 
-Sessions are stored as YAML files in `.sessions/` at the repository root. Each session is keyed by its ticket or batch ID.
-
-```text
-.sessions/
-  FEAT-1.yaml
-  MY-BATCH.yaml
-```
+Sessions are stored in SQLite at `.ticket/state.db` (the authoritative store for all execution state: status, start time, duration, notes). YAML files in `.sessions/` are a legacy format that is automatically migrated on first use.
 
 ### Concurrent Sessions
 
@@ -221,18 +209,17 @@ ticket status
 
 ### Session Reconciliation
 
-Session files are operator telemetry, not the source of truth for ticket progress. Backlog status remains authoritative.
+Sessions are operator telemetry, not the source of truth for ticket progress. Backlog markdown remains authoritative for ticket definitions.
 
 Use `ticket reconcile` to detect:
 
 - sessions left open after a ticket is marked `Done`
 - sessions pointing at missing backlog files
 - sessions whose ticket heading no longer exists
-- malformed session YAML
 
 ### Legacy Migration
 
-If a legacy `.session` file exists (from the single-session era), it is automatically migrated to `.sessions/<ID>.yaml` on first access.
+If YAML session files exist in `.sessions/` (from before the SQLite migration), they are automatically imported into `.ticket/state.db` on first command invocation.
 
 ## Pre-Commit Hook Integration
 

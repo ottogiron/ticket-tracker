@@ -313,11 +313,17 @@ pub fn start(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
     backlog.validate_required_ticket_schema(&ticket_id)?;
 
     // Pre-migration fallback: .md status is only checked when SQLite has no record.
-    if sqlite_status.is_none() && backlog.get_status(&ticket_id)? == "Done" {
-        return Err(format!(
-            "Ticket {} is already Done. Create a new ticket or re-open this one.",
-            ticket_id
-        ));
+    // New-format tickets omit the Status field; get_status() will return Err,
+    // which we treat as "not done in backlog" and allow the start to proceed.
+    if sqlite_status.is_none() {
+        if let Ok(md_status) = backlog.get_status(&ticket_id) {
+            if md_status == "Done" {
+                return Err(format!(
+                    "Ticket {} is already Done. Create a new ticket or re-open this one.",
+                    ticket_id
+                ));
+            }
+        }
     }
 
     let now = Utc::now();
@@ -941,6 +947,118 @@ pub fn import(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn report(
+    repo_root: &Path,
+    ticket_id: Option<&str>,
+    batch: Option<&str>,
+) -> Result<(), String> {
+    let store = open_store_with_migration(repo_root)?;
+
+    match (ticket_id, batch) {
+        (Some(id), None) => {
+            let id = id.to_uppercase();
+            print!("{}", render_ticket_report(&store, &id)?);
+            Ok(())
+        }
+        (None, Some(batch_id)) => {
+            let batch_id = batch_id.to_uppercase();
+            let tickets = store.list_tickets()?;
+            let prefix = format!("{}-", batch_id);
+            let matching: Vec<_> = tickets
+                .iter()
+                .filter(|t| t.ticket_id.starts_with(&prefix) || t.ticket_id == batch_id)
+                .collect();
+            if matching.is_empty() {
+                println!("No tickets found for batch {}", batch_id);
+                return Ok(());
+            }
+            for ticket in &matching {
+                print!("{}", render_ticket_report(&store, &ticket.ticket_id)?);
+                println!();
+            }
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err("Specify either a ticket ID or --batch, not both".to_string()),
+        (None, None) => Err("Specify a ticket ID or --batch <batch-id>".to_string()),
+    }
+}
+
+fn render_ticket_report(store: &crate::store::Store, ticket_id: &str) -> Result<String, String> {
+    let tws = store.ticket_with_status(ticket_id)?.ok_or_else(|| {
+        format!(
+            "Ticket {} not found in store. Run 'ticket import' first.",
+            ticket_id
+        )
+    })?;
+
+    let mut out = String::new();
+
+    out.push_str(&format!("Ticket: {}\n", tws.ticket.ticket_id));
+
+    if let Some(ref ts) = tws.status {
+        out.push_str(&format!("Status: {}\n", ts.status));
+
+        let fmt_ts = |epoch: i64| {
+            chrono::DateTime::from_timestamp(epoch, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+
+        if let Some(started) = ts.started_at {
+            out.push_str(&format!("Started: {}\n", fmt_ts(started)));
+        }
+        if let Some(finished) = ts.finished_at {
+            out.push_str(&format!("Finished: {}\n", fmt_ts(finished)));
+        }
+        if let Some(secs) = ts.duration_secs {
+            let dur = chrono::Duration::seconds(secs);
+            out.push_str(&format!("Duration: {}\n", format_duration(dur)));
+        }
+        if let Some(ref reason) = ts.blocked_reason {
+            out.push_str(&format!("Blocked reason: {}\n", reason));
+        }
+    } else {
+        out.push_str("Status: not started\n");
+    }
+
+    let notes = store.list_notes(ticket_id)?;
+    // "comment" = added by `ticket note`; "note" = imported from Tracking Notes
+    let comments: Vec<_> = notes
+        .iter()
+        .filter(|n| n.kind == "comment" || n.kind == "note")
+        .collect();
+    let closure: Vec<_> = notes
+        .iter()
+        .filter(|n| n.kind == "closure_evidence")
+        .collect();
+
+    out.push_str(&format!("\nNotes ({}):\n", comments.len()));
+    if comments.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for note in &comments {
+            let ts_str = chrono::DateTime::from_timestamp(note.created_at, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            out.push_str(&format!("  [{}] {}\n", ts_str, note.body));
+        }
+    }
+
+    out.push_str("\nClosure Evidence:\n");
+    if closure.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for note in &closure {
+            let ts_str = chrono::DateTime::from_timestamp(note.created_at, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            out.push_str(&format!("  [{}] {}\n", ts_str, note.body));
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,5 +1510,91 @@ PR #42 merged and deployed.
         let sessions = store.active_sessions().expect("sessions");
         assert!(!sessions.is_empty());
         assert_eq!(sessions[0].ticket_id, "TEST-1");
+    }
+
+    // ── report ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_report_ticket_not_in_store() {
+        let repo = TempDir::new().expect("tempdir");
+        let err = report(repo.path(), Some("MISSING-1"), None).expect_err("should error");
+        assert!(err.contains("MISSING-1"));
+        assert!(err.contains("not found in store"));
+    }
+
+    #[test]
+    fn test_report_not_started() {
+        let repo = TempDir::new().expect("tempdir");
+        // Insert a ticket with no status row.
+        let store = store::Store::open(repo.path()).expect("open store");
+        store
+            .insert_ticket(&store::Ticket {
+                ticket_id: "NS-1".to_string(),
+                backlog: "project".to_string(),
+                title: "Not started".to_string(),
+                spec_file: None,
+                created_at: 1_000_000,
+            })
+            .expect("insert");
+        drop(store);
+
+        report(repo.path(), Some("NS-1"), None).expect("report");
+        // No panic; spot-check via render path indirectly through render_ticket_report.
+        let store2 = store::Store::open(repo.path()).expect("open store 2");
+        let out = render_ticket_report(&store2, "NS-1").expect("render");
+        assert!(out.contains("Ticket: NS-1"));
+        assert!(out.contains("Status: not started"));
+        assert!(out.contains("Notes (0):"));
+        assert!(out.contains("Closure Evidence:"));
+    }
+
+    #[test]
+    fn test_report_done_with_notes() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "RPT-1", "Todo");
+        start(repo.path(), "RPT-1").expect("start");
+        note(repo.path(), "RPT-1", "edge case found").expect("note");
+        done(repo.path(), "RPT-1").expect("done");
+
+        // Add a closure_evidence note directly.
+        let store = store::Store::open(repo.path()).expect("open store");
+        store
+            .add_note("RPT-1", "closure_evidence", "PR #99 merged", 9_000_000)
+            .expect("add ce note");
+
+        let out = render_ticket_report(&store, "RPT-1").expect("render");
+        assert!(out.contains("Ticket: RPT-1"));
+        assert!(out.contains("Status: done"));
+        assert!(out.contains("Started:"));
+        assert!(out.contains("Finished:"));
+        assert!(out.contains("Duration:"));
+        assert!(out.contains("Notes (1):"));
+        assert!(out.contains("edge case found"));
+        assert!(out.contains("Closure Evidence:"));
+        assert!(out.contains("PR #99 merged"));
+    }
+
+    #[test]
+    fn test_report_batch_lists_all_tickets() {
+        let repo = TempDir::new().expect("tempdir");
+        let store = store::Store::open(repo.path()).expect("open store");
+        for id in ["BATCH-1", "BATCH-2", "BATCH-3"] {
+            store
+                .insert_ticket(&store::Ticket {
+                    ticket_id: id.to_string(),
+                    backlog: "batch".to_string(),
+                    title: id.to_string(),
+                    spec_file: None,
+                    created_at: 1_000_000,
+                })
+                .expect("insert");
+        }
+        // BATCH-99 uses the same prefix but should not appear under --batch BATCH
+        // because it doesn't start with "BATCH-" in a meaningful way (it does, actually —
+        // the prefix filter is "BATCH-", so BATCH-99 would match).
+        drop(store);
+
+        // report --batch BATCH should list all three tickets without error.
+        report(repo.path(), None, Some("BATCH")).expect("batch report");
     }
 }

@@ -127,6 +127,15 @@ enum Commands {
         note: String,
     },
     Import,
+    Report {
+        /// Ticket ID (e.g., FEAT-1). Omit when using --batch.
+        ticket_id: Option<String>,
+        #[arg(
+            long,
+            help = "Batch ID — report all tickets whose ID starts with this prefix"
+        )]
+        batch: Option<String>,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<(), String> {
@@ -155,6 +164,9 @@ pub fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Note { ticket_id, note } => commands::note(&repo_root, &ticket_id, &note),
         Commands::Import => commands::import(&repo_root),
+        Commands::Report { ticket_id, batch } => {
+            commands::report(&repo_root, ticket_id.as_deref(), batch.as_deref())
+        }
     }
 }
 

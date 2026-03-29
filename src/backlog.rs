@@ -150,7 +150,6 @@ impl Backlog {
             "Dependencies",
             "Acceptance criteria",
             "Verification",
-            "Status",
         ];
 
         let mut missing = Vec::new();
@@ -220,6 +219,9 @@ impl Backlog {
         let tracking_section_re =
             Regex::new(r"(?m)^## Tracking Notes\n").map_err(|e| format!("Regex error: {}", e))?;
 
+        // Matches legacy section names that may follow Tracking Notes in old-format
+        // backlogs. For new-format backlogs that omit these sections the pattern
+        // simply returns None, and the fallback `self.content.len()` is used.
         let next_section_re = Regex::new(r"(?m)^## (Execution Metrics|Closure Evidence)")
             .map_err(|e| format!("Regex error: {}", e))?;
 
