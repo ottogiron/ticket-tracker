@@ -108,6 +108,11 @@ enum Commands {
     Reconcile {
         #[arg(long, help = "Emit reconciliation results as JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "Exit non-zero unless every session is Active (batch counts as non-Active)"
+        )]
+        strict: bool,
     },
     Blocked {
         #[arg(help = "Ticket ID (e.g., FLUX-123)")]
@@ -144,7 +149,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Commands::Status => commands::status(&repo_root),
-        Commands::Reconcile { json } => commands::reconcile(&repo_root, json),
+        Commands::Reconcile { json, strict } => commands::reconcile(&repo_root, json, strict),
         Commands::Blocked { ticket_id, reason } => {
             commands::blocked(&repo_root, &ticket_id, &reason)
         }

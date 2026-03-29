@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- migrate CLI commands from YAML/markdown to SQLite backend: `ticket start`, `done`, `status`, `blocked`, `note`, and `reconcile` now read/write `.ticket/state.db` instead of `.sessions/*.yaml` and backlog `.md` fields. Existing `.sessions/*.yaml` files are auto-migrated on first command. `ticket reconcile` gains a `--strict` flag (exit non-zero unless every session is `Active`). The `StaleDone`, `StaleBlocked`, and `StatusMismatch` reconcile statuses are no longer generated for SQLite sessions because the tool no longer reads or writes `.md` status fields; only `Active`, `BatchActive`, `MissingBacklog`, and `MissingTicket` are produced.
 - `--repo-root` auto-detects the main git repository root via `git rev-parse --git-common-dir`. Works correctly from subdirectories and linked git worktrees. Falls back to `.` if not inside a git repo.
 
 ### Fixed

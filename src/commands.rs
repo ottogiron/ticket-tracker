@@ -1,9 +1,12 @@
-use crate::store::{Store, Ticket, TicketStatus};
-use crate::{Backlog, DerivedStatus, ReconcileReport, Session};
+use crate::store::{self, Store, Ticket, TicketStatus};
+use crate::{
+    Backlog, DerivedStatus, ReconcileReport, ReconcileSummary, Session, SessionDiagnostic,
+    SESSION_DIR,
+};
 use chrono::{NaiveDateTime, Utc};
 use regex::Regex;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn format_duration(duration: chrono::Duration) -> String {
     let total_secs = duration.num_seconds();
@@ -145,39 +148,203 @@ fn render_reconcile(report: &ReconcileReport) -> String {
     output
 }
 
+/// Open the SQLite store, migrating any YAML sessions from `.sessions/` when
+/// the database does not yet exist.
+fn open_store_with_migration(repo_root: &Path) -> Result<store::Store, String> {
+    let db_path = repo_root.join(".ticket").join("state.db");
+    let yaml_dir = repo_root.join(SESSION_DIR);
+
+    // Collect YAML sessions before opening the store (which creates the DB file).
+    let yaml_sessions = if !db_path.exists() && yaml_dir.exists() {
+        Session::list_all(repo_root)?
+    } else {
+        vec![]
+    };
+
+    let store = store::Store::open(repo_root)?;
+
+    if !yaml_sessions.is_empty() {
+        eprintln!(
+            "Migrating {} YAML session(s) to SQLite...",
+            yaml_sessions.len()
+        );
+        for session in &yaml_sessions {
+            let backlog_str = session.file.to_string_lossy().into_owned();
+            let ts = session.start.timestamp();
+            if store.get_ticket(&session.ticket_id)?.is_none() {
+                store.insert_ticket(&store::Ticket {
+                    ticket_id: session.ticket_id.clone(),
+                    backlog: backlog_str,
+                    title: session.ticket_id.clone(),
+                    spec_file: None,
+                    created_at: ts,
+                })?;
+            }
+            store.insert_session(&session.ticket_id, &session.mode, None, ts)?;
+        }
+        eprintln!("Migration complete.");
+    }
+
+    Ok(store)
+}
+
+/// Build a ReconcileReport by validating SQLite active sessions against
+/// backlog .md headings.
+fn reconcile_from_store(store: &store::Store, repo_root: &Path) -> Result<ReconcileReport, String> {
+    let sessions = store.active_sessions()?;
+    let mut diagnostics: Vec<SessionDiagnostic> = Vec::new();
+
+    for session in &sessions {
+        let backlog_path = store
+            .get_ticket(&session.ticket_id)?
+            .map(|t| PathBuf::from(&t.backlog))
+            .unwrap_or_else(|| PathBuf::from(format!("unknown/{}.md", session.ticket_id)));
+
+        let start = chrono::DateTime::from_timestamp(session.started_at, 0);
+
+        let resolved = if backlog_path.is_absolute() {
+            backlog_path
+        } else {
+            repo_root.join(&backlog_path)
+        };
+
+        let diagnostic = if !resolved.exists() {
+            SessionDiagnostic {
+                ticket_id: session.ticket_id.clone(),
+                mode: session.mode.clone(),
+                file: resolved,
+                start,
+                derived_status: DerivedStatus::MissingBacklog,
+                backlog_status: None,
+                message: Some("Referenced backlog file does not exist".to_string()),
+            }
+        } else if session.mode == "batch" {
+            SessionDiagnostic {
+                ticket_id: session.ticket_id.clone(),
+                mode: session.mode.clone(),
+                file: resolved,
+                start,
+                derived_status: DerivedStatus::BatchActive,
+                backlog_status: None,
+                message: None,
+            }
+        } else {
+            // Validate that the ticket heading still exists in the backlog file.
+            match Backlog::read(&resolved).and_then(|b| b.get_status(&session.ticket_id)) {
+                Ok(_) => SessionDiagnostic {
+                    ticket_id: session.ticket_id.clone(),
+                    mode: session.mode.clone(),
+                    file: resolved,
+                    start,
+                    derived_status: DerivedStatus::Active,
+                    backlog_status: None,
+                    message: None,
+                },
+                Err(e) => SessionDiagnostic {
+                    ticket_id: session.ticket_id.clone(),
+                    mode: session.mode.clone(),
+                    file: resolved,
+                    start,
+                    derived_status: DerivedStatus::MissingTicket,
+                    backlog_status: None,
+                    message: Some(e),
+                },
+            }
+        };
+
+        diagnostics.push(diagnostic);
+    }
+
+    diagnostics.sort_by(|a, b| a.ticket_id.cmp(&b.ticket_id));
+
+    let mut summary = ReconcileSummary::default();
+    for d in &diagnostics {
+        summary.total_sessions += 1;
+        match d.derived_status {
+            DerivedStatus::Active => summary.active += 1,
+            DerivedStatus::BatchActive => summary.batch_active += 1,
+            DerivedStatus::StaleDone => summary.stale_done += 1,
+            DerivedStatus::StaleBlocked => summary.stale_blocked += 1,
+            DerivedStatus::StatusMismatch => summary.status_mismatch += 1,
+            DerivedStatus::MissingBacklog => summary.missing_backlog += 1,
+            DerivedStatus::MissingTicket => summary.missing_ticket += 1,
+            DerivedStatus::InvalidSession => summary.invalid_session += 1,
+        }
+    }
+
+    let ok = diagnostics.iter().all(|d| {
+        matches!(
+            d.derived_status,
+            DerivedStatus::Active | DerivedStatus::BatchActive
+        )
+    });
+
+    Ok(ReconcileReport {
+        ok,
+        sessions: diagnostics,
+        summary,
+    })
+}
+
 pub fn start(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
     let ticket_id = ticket_id.to_uppercase();
 
-    if let Some(session) = Session::read(repo_root, &ticket_id)? {
-        if session.ticket_id == ticket_id {
-            println!("Ticket {} is already in progress", ticket_id);
-            return Ok(());
+    let store = open_store_with_migration(repo_root)?;
+
+    let active = store.active_sessions()?;
+    if active.iter().any(|s| s.ticket_id == ticket_id) {
+        println!("Ticket {} is already in progress", ticket_id);
+        return Ok(());
+    }
+
+    // Done-guard: SQLite is authoritative for tickets managed by the new system.
+    let sqlite_status = store.get_ticket_status(&ticket_id)?;
+    if let Some(ref ts) = sqlite_status {
+        if ts.status == "done" {
+            return Err(format!(
+                "Ticket {} is already Done. Create a new ticket or re-open this one.",
+                ticket_id
+            ));
         }
     }
 
     let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
-    let mut backlog = Backlog::read(&backlog_path)?;
+    let backlog = Backlog::read(&backlog_path)?;
     backlog.validate_required_ticket_schema(&ticket_id)?;
 
-    let current_status = backlog.get_status(&ticket_id)?;
-    if current_status == "Done" {
+    // Pre-migration fallback: .md status is only checked when SQLite has no record.
+    if sqlite_status.is_none() && backlog.get_status(&ticket_id)? == "Done" {
         return Err(format!(
             "Ticket {} is already Done. Create a new ticket or re-open this one.",
             ticket_id
         ));
     }
-    if current_status == "In Progress" {
-        println!("Resuming ticket {} (session was lost)", ticket_id);
+
+    let now = Utc::now();
+    let now_ts = now.timestamp();
+    let backlog_str = backlog_path.to_string_lossy().into_owned();
+
+    if store.get_ticket(&ticket_id)?.is_none() {
+        store.insert_ticket(&store::Ticket {
+            ticket_id: ticket_id.clone(),
+            backlog: backlog_str,
+            title: ticket_id.clone(),
+            spec_file: None,
+            created_at: now_ts,
+        })?;
     }
 
-    backlog.update_status(&ticket_id, "In Progress")?;
-    backlog.ensure_metrics_entry(&ticket_id)?;
-    let now = Utc::now();
-    backlog.set_start_time(&ticket_id, now)?;
-    backlog.write()?;
+    store.upsert_ticket_status(&store::TicketStatus {
+        ticket_id: ticket_id.clone(),
+        status: "in_progress".to_string(),
+        blocked_reason: None,
+        started_at: Some(now_ts),
+        finished_at: None,
+        duration_secs: None,
+        updated_at: now_ts,
+    })?;
 
-    let session = Session::new(&ticket_id, backlog_path);
-    session.write(repo_root)?;
+    store.insert_session(&ticket_id, "ticket", None, now_ts)?;
 
     println!(
         "Ticket {} started at {}",
@@ -195,18 +362,34 @@ pub fn start(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
 pub fn start_batch(repo_root: &Path, batch_id: &str) -> Result<(), String> {
     let batch_id = batch_id.to_uppercase();
 
-    if let Some(session) = Session::read(repo_root, &batch_id)? {
-        if session.ticket_id == batch_id && session.mode == "batch" {
-            println!("Batch {} is already in progress", batch_id);
-            return Ok(());
-        }
+    let store = open_store_with_migration(repo_root)?;
+
+    let active = store.active_sessions()?;
+    if active
+        .iter()
+        .any(|s| s.ticket_id == batch_id && s.mode == "batch")
+    {
+        println!("Batch {} is already in progress", batch_id);
+        return Ok(());
     }
 
     let backlog_path = Session::find_backlog_file_by_batch(repo_root, &batch_id)?;
 
     let now = Utc::now();
-    let session = Session::new_batch(&batch_id, backlog_path.clone());
-    session.write(repo_root)?;
+    let now_ts = now.timestamp();
+    let backlog_str = backlog_path.to_string_lossy().into_owned();
+
+    if store.get_ticket(&batch_id)?.is_none() {
+        store.insert_ticket(&store::Ticket {
+            ticket_id: batch_id.clone(),
+            backlog: backlog_str,
+            title: format!("Batch: {}", batch_id),
+            spec_file: None,
+            created_at: now_ts,
+        })?;
+    }
+
+    store.insert_session(&batch_id, "batch", None, now_ts)?;
 
     println!(
         "Batch {} started at {}",
@@ -215,19 +398,19 @@ pub fn start_batch(repo_root: &Path, batch_id: &str) -> Result<(), String> {
     );
     println!("All tickets in {} are in scope", backlog_path.display());
 
-    // Show other active sessions if any
-    let all = Session::list_all(repo_root)?;
-    let others: Vec<_> = all.iter().filter(|s| s.ticket_id != batch_id).collect();
+    let all_active = store.active_sessions()?;
+    let others: Vec<_> = all_active
+        .iter()
+        .filter(|s| s.ticket_id != batch_id)
+        .collect();
     if !others.is_empty() {
         println!();
         println!("Other active sessions:");
         for s in &others {
-            println!(
-                "  {} ({}) — started {}",
-                s.ticket_id,
-                s.mode,
-                s.start.format("%Y-%m-%d %H:%M UTC")
-            );
+            let start_str = chrono::DateTime::from_timestamp(s.started_at, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("  {} ({}) — started {}", s.ticket_id, s.mode, start_str);
         }
     }
 
@@ -237,24 +420,25 @@ pub fn start_batch(repo_root: &Path, batch_id: &str) -> Result<(), String> {
 pub fn done_batch(repo_root: &Path, batch_id: &str) -> Result<(), String> {
     let batch_id = batch_id.to_uppercase();
 
-    let session = Session::read(repo_root, &batch_id)?.ok_or_else(|| {
-        format!(
-            "No active session for batch {}. Run 'ticket start --batch {}' first.",
-            batch_id, batch_id
-        )
-    })?;
+    let store = open_store_with_migration(repo_root)?;
 
-    if session.mode != "batch" {
-        return Err(format!(
-            "Session {} is ticket-mode, not batch-mode. Use 'ticket done {}' instead.",
-            session.ticket_id, session.ticket_id
-        ));
-    }
+    let active = store.active_sessions()?;
+    let session = active
+        .iter()
+        .find(|s| s.ticket_id == batch_id && s.mode == "batch")
+        .ok_or_else(|| {
+            format!(
+                "No active session for batch {}. Run 'ticket start --batch {}' first.",
+                batch_id, batch_id
+            )
+        })?
+        .clone();
 
-    let duration = session.elapsed();
     let end_time = Utc::now();
+    let end_ts = end_time.timestamp();
+    let duration = chrono::Duration::seconds(end_ts - session.started_at);
 
-    Session::remove(repo_root, &batch_id)?;
+    store.close_session(session.session_id, end_ts)?;
 
     println!("Batch {} completed", batch_id);
     println!("  Duration: {}", format_duration(duration));
@@ -266,25 +450,35 @@ pub fn done_batch(repo_root: &Path, batch_id: &str) -> Result<(), String> {
 pub fn done(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
     let ticket_id = ticket_id.to_uppercase();
 
-    let session = Session::read(repo_root, &ticket_id)?.ok_or_else(|| {
-        format!(
-            "No active session for ticket {}. Run 'ticket start {}' first.",
-            ticket_id, ticket_id
-        )
-    })?;
+    let store = open_store_with_migration(repo_root)?;
 
-    let mut backlog = Backlog::read(&session.file)?;
+    let active = store.active_sessions()?;
+    let session = active
+        .iter()
+        .find(|s| s.ticket_id == ticket_id && s.mode != "batch")
+        .ok_or_else(|| {
+            format!(
+                "No active session for ticket {}. Run 'ticket start {}' first.",
+                ticket_id, ticket_id
+            )
+        })?
+        .clone();
 
     let end_time = Utc::now();
-    let duration = session.elapsed();
+    let end_ts = end_time.timestamp();
+    let duration_secs = end_ts - session.started_at;
+    let duration = chrono::Duration::seconds(duration_secs);
 
-    backlog.update_status(&ticket_id, "Done")?;
-    backlog.ensure_metrics_entry(&ticket_id)?;
-    backlog.set_end_time(&ticket_id, end_time)?;
-    backlog.set_duration(&ticket_id, &format_duration(duration))?;
-    backlog.write()?;
-
-    Session::remove(repo_root, &ticket_id)?;
+    store.close_session(session.session_id, end_ts)?;
+    store.upsert_ticket_status(&store::TicketStatus {
+        ticket_id: ticket_id.clone(),
+        status: "done".to_string(),
+        blocked_reason: None,
+        started_at: Some(session.started_at),
+        finished_at: Some(end_ts),
+        duration_secs: Some(duration_secs),
+        updated_at: end_ts,
+    })?;
 
     println!("Ticket {} completed", ticket_id);
     println!("  Duration: {}", format_duration(duration));
@@ -294,23 +488,34 @@ pub fn done(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
 }
 
 pub fn status(repo_root: &Path) -> Result<(), String> {
-    let report = Session::reconcile_all(repo_root)?;
+    let store = open_store_with_migration(repo_root)?;
+    let report = reconcile_from_store(&store, repo_root)?;
     print!("{}", render_status(&report));
     Ok(())
 }
 
-pub fn reconcile(repo_root: &Path, json: bool) -> Result<(), String> {
-    let report = Session::reconcile_all(repo_root)?;
+pub fn reconcile(repo_root: &Path, json: bool, strict: bool) -> Result<(), String> {
+    let store = open_store_with_migration(repo_root)?;
+    let report = reconcile_from_store(&store, repo_root)?;
 
     if json {
-        let json = serde_json::to_string_pretty(&report)
+        let out = serde_json::to_string_pretty(&report)
             .map_err(|e| format!("Failed to serialize reconcile report: {}", e))?;
-        println!("{}", json);
+        println!("{}", out);
     } else {
         print!("{}", render_reconcile(&report));
     }
 
-    if report.ok {
+    let success = if strict {
+        report
+            .sessions
+            .iter()
+            .all(|s| matches!(s.derived_status, DerivedStatus::Active))
+    } else {
+        report.ok
+    };
+
+    if success {
         Ok(())
     } else {
         Err("Found stale or inconsistent sessions".to_string())
@@ -320,19 +525,45 @@ pub fn reconcile(repo_root: &Path, json: bool) -> Result<(), String> {
 pub fn blocked(repo_root: &Path, ticket_id: &str, reason: &str) -> Result<(), String> {
     let ticket_id = ticket_id.to_uppercase();
 
-    let session = Session::read(repo_root, &ticket_id)?;
-    let backlog_path = if let Some(ref session) = session {
-        session.file.clone()
-    } else {
-        Session::find_backlog_file(repo_root, &ticket_id)?
-    };
+    let store = open_store_with_migration(repo_root)?;
 
-    let mut backlog = Backlog::read(&backlog_path)?;
-    backlog.update_status(&ticket_id, "Blocked")?;
-    backlog.add_tracking_note(&ticket_id, &format!("Blocked: {}", reason))?;
-    backlog.write()?;
+    // Intentional: `blocked` is permitted without an active session so that a
+    // ticket can be marked blocked before (or after) a session was started.
+    // Any open sessions are closed as part of this command.
+    let now_ts = Utc::now().timestamp();
 
-    Session::remove(repo_root, &ticket_id)?;
+    if store.get_ticket(&ticket_id)?.is_none() {
+        let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
+        let backlog_str = backlog_path.to_string_lossy().into_owned();
+        store.insert_ticket(&store::Ticket {
+            ticket_id: ticket_id.clone(),
+            backlog: backlog_str,
+            title: ticket_id.clone(),
+            spec_file: None,
+            created_at: now_ts,
+        })?;
+    }
+
+    let started_at = store
+        .get_ticket_status(&ticket_id)?
+        .and_then(|s| s.started_at);
+
+    store.upsert_ticket_status(&store::TicketStatus {
+        ticket_id: ticket_id.clone(),
+        status: "blocked".to_string(),
+        blocked_reason: Some(reason.to_string()),
+        started_at,
+        finished_at: None,
+        duration_secs: None,
+        updated_at: now_ts,
+    })?;
+
+    let active = store.active_sessions()?;
+    for session in active.iter().filter(|s| s.ticket_id == ticket_id) {
+        store.close_session(session.session_id, now_ts)?;
+    }
+
+    store.add_note(&ticket_id, "blocker", reason, now_ts)?;
 
     println!("Ticket {} marked as Blocked", ticket_id);
     println!("Reason: {}", reason);
@@ -343,10 +574,23 @@ pub fn blocked(repo_root: &Path, ticket_id: &str, reason: &str) -> Result<(), St
 pub fn note(repo_root: &Path, ticket_id: &str, note: &str) -> Result<(), String> {
     let ticket_id = ticket_id.to_uppercase();
 
-    let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
-    let mut backlog = Backlog::read(&backlog_path)?;
-    backlog.add_tracking_note(&ticket_id, note)?;
-    backlog.write()?;
+    let store = open_store_with_migration(repo_root)?;
+
+    let now_ts = Utc::now().timestamp();
+
+    if store.get_ticket(&ticket_id)?.is_none() {
+        let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
+        let backlog_str = backlog_path.to_string_lossy().into_owned();
+        store.insert_ticket(&store::Ticket {
+            ticket_id: ticket_id.clone(),
+            backlog: backlog_str,
+            title: ticket_id.clone(),
+            spec_file: None,
+            created_at: now_ts,
+        })?;
+    }
+
+    store.add_note(&ticket_id, "comment", note, now_ts)?;
 
     println!("Note added to ticket {}", ticket_id);
 
@@ -700,8 +944,12 @@ pub fn import(repo_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ReconcileSummary, SessionDiagnostic};
+    use crate::{ReconcileSummary, SessionDiagnostic, BACKLOG_DIR};
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // ── render helpers ────────────────────────────────────────────────────────
 
     fn report_with_session(session: SessionDiagnostic) -> ReconcileReport {
         ReconcileReport {
@@ -741,6 +989,8 @@ mod tests {
             sessions: vec![session],
         }
     }
+
+    // ── render tests ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_render_status_reports_stale_done() {
@@ -935,5 +1185,212 @@ PR #42 merged and deployed.
 
         let store = Store::open(dir.path()).expect("open store");
         assert!(store.list_tickets().expect("list").is_empty());
+    }
+
+    // ── command integration tests ─────────────────────────────────────────────
+
+    fn make_backlog_ticket(repo: &TempDir, ticket_id: &str, status: &str) -> PathBuf {
+        let backlog_dir = repo.path().join(BACKLOG_DIR);
+        fs::create_dir_all(&backlog_dir).expect("create backlog dir");
+        let path = backlog_dir.join("test.md");
+        let content = format!(
+            "## Ticket {} — Test\n\
+             - Goal: Test goal\n\
+             - In scope:\n  - x\n\
+             - Out of scope:\n  - y\n\
+             - Dependencies: none\n\
+             - Acceptance criteria:\n  - pass\n\
+             - Verification:\n  - cargo test\n\
+             - Status: {}\n",
+            ticket_id, status
+        );
+        fs::write(&path, content).expect("write backlog");
+        path
+    }
+
+    #[test]
+    fn test_start_creates_sqlite_session() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let sessions = store.active_sessions().expect("active sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].ticket_id, "TEST-1");
+        assert_eq!(sessions[0].mode, "ticket");
+    }
+
+    #[test]
+    fn test_start_idempotent() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("first start");
+        start(repo.path(), "TEST-1").expect("second start");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        assert_eq!(store.active_sessions().expect("sessions").len(), 1);
+    }
+
+    #[test]
+    fn test_start_rejects_done_ticket() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Done");
+        let err = start(repo.path(), "TEST-1").expect_err("should error");
+        assert!(err.contains("already Done"));
+    }
+
+    #[test]
+    fn test_start_rejects_sqlite_done_ticket() {
+        // Ensure the SQLite done-guard fires even when .md still says "Todo".
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+        done(repo.path(), "TEST-1").expect("done");
+        // .md still says "Todo", but SQLite records status = "done".
+        let err = start(repo.path(), "TEST-1").expect_err("second start should be rejected");
+        assert!(err.contains("already Done"));
+    }
+
+    #[test]
+    fn test_start_does_not_modify_backlog_md() {
+        let repo = TempDir::new().expect("tempdir");
+        let path = make_backlog_ticket(&repo, "TEST-1", "Todo");
+        let before = fs::read_to_string(&path).expect("read");
+        start(repo.path(), "TEST-1").expect("start");
+        let after = fs::read_to_string(&path).expect("read after");
+        assert_eq!(before, after, "start must not modify the backlog .md");
+    }
+
+    #[test]
+    fn test_done_closes_session_and_updates_status() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+        done(repo.path(), "TEST-1").expect("done");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        assert!(store.active_sessions().expect("sessions").is_empty());
+        let ts = store
+            .get_ticket_status("TEST-1")
+            .expect("status")
+            .expect("some");
+        assert_eq!(ts.status, "done");
+        assert!(ts.finished_at.is_some());
+        assert!(ts.duration_secs.is_some());
+    }
+
+    #[test]
+    fn test_done_does_not_modify_backlog_md() {
+        let repo = TempDir::new().expect("tempdir");
+        let path = make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+        let before = fs::read_to_string(&path).expect("read");
+        done(repo.path(), "TEST-1").expect("done");
+        let after = fs::read_to_string(&path).expect("read after");
+        assert_eq!(before, after, "done must not modify the backlog .md");
+    }
+
+    #[test]
+    fn test_done_without_session_errors() {
+        let repo = TempDir::new().expect("tempdir");
+        let err = done(repo.path(), "TEST-1").expect_err("should error");
+        assert!(err.contains("No active session"));
+    }
+
+    #[test]
+    fn test_blocked_closes_session_and_updates_status() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+        blocked(repo.path(), "TEST-1", "waiting for dep").expect("blocked");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        assert!(store.active_sessions().expect("sessions").is_empty());
+        let ts = store
+            .get_ticket_status("TEST-1")
+            .expect("status")
+            .expect("some");
+        assert_eq!(ts.status, "blocked");
+        assert_eq!(ts.blocked_reason.as_deref(), Some("waiting for dep"));
+        let notes = store.list_notes("TEST-1").expect("notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].kind, "blocker");
+        assert_eq!(notes[0].body, "waiting for dep");
+    }
+
+    #[test]
+    fn test_note_adds_comment_to_store() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+        note(repo.path(), "TEST-1", "edge case found").expect("note");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let notes = store.list_notes("TEST-1").expect("notes");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].kind, "comment");
+        assert_eq!(notes[0].body, "edge case found");
+    }
+
+    #[test]
+    fn test_reconcile_active_session_is_ok() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+        reconcile(repo.path(), false, false).expect("reconcile must succeed");
+    }
+
+    #[test]
+    fn test_reconcile_strict_fails_on_batch_session() {
+        let repo = TempDir::new().expect("tempdir");
+        let backlog_dir = repo.path().join(BACKLOG_DIR);
+        fs::create_dir_all(&backlog_dir).expect("create backlog dir");
+        fs::write(
+            backlog_dir.join("batch.md"),
+            "## Ticket BATCH-1 — T\n- Status: Todo\n",
+        )
+        .expect("write");
+        start_batch(repo.path(), "BATCH").expect("start batch");
+
+        let err = reconcile(repo.path(), false, true).expect_err("strict should fail");
+        assert!(err.contains("stale or inconsistent"));
+    }
+
+    #[test]
+    fn test_reconcile_missing_ticket_heading() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+
+        // Remove the ticket heading from backlog so reconcile detects it missing
+        let backlog_path = repo.path().join(BACKLOG_DIR).join("test.md");
+        fs::write(&backlog_path, "## Ticket OTHER-1 — T\n- Status: Todo\n").expect("overwrite");
+
+        let err = reconcile(repo.path(), false, false).expect_err("should detect missing ticket");
+        assert!(err.contains("stale or inconsistent"));
+    }
+
+    #[test]
+    fn test_yaml_migration_on_first_command() {
+        let repo = TempDir::new().expect("tempdir");
+        let path = make_backlog_ticket(&repo, "TEST-1", "Todo");
+
+        // Write a legacy YAML session
+        let sessions_dir = repo.path().join(SESSION_DIR);
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let yaml = format!(
+            "ticket_id: TEST-1\nstart: 2026-01-01T00:00:00Z\nfile: {}\nmode: ticket\n",
+            path.display()
+        );
+        fs::write(sessions_dir.join("TEST-1.yaml"), &yaml).expect("write yaml");
+
+        // First command triggers migration; the YAML session is already active
+        start(repo.path(), "TEST-1").expect("start (idempotent after migration)");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let sessions = store.active_sessions().expect("sessions");
+        assert!(!sessions.is_empty());
+        assert_eq!(sessions[0].ticket_id, "TEST-1");
     }
 }
