@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 pub mod backlog;
 pub mod commands;
 pub mod session;
+pub mod store;
 
 pub use backlog::Backlog;
 pub use session::{DerivedStatus, ReconcileReport, ReconcileSummary, Session, SessionDiagnostic};

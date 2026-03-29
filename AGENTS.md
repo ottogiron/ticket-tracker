@@ -21,6 +21,7 @@ This is a standalone repository (`ottogiron/ticket-tracker`).
 - `src/commands.rs` — command implementations (start, done, status, reconcile, blocked, note)
 - `src/session.rs` — session lifecycle, reconciliation, and I/O (`.sessions/` YAML files)
 - `src/backlog.rs` — backlog file parsing, schema validation, and field manipulation
+- `src/store.rs` — SQLite persistence for ticket state, sessions, and notes (`.ticket/state.db`)
 
 ## Build Commands
 
