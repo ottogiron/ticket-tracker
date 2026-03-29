@@ -653,7 +653,7 @@ fn map_status(s: &str) -> &str {
 pub fn import(repo_root: &Path) -> Result<(), String> {
     let backlog_dir = repo_root.join(crate::BACKLOG_DIR);
 
-    let pattern = backlog_dir.join("*.md").to_string_lossy().into_owned();
+    let pattern = backlog_dir.join("**/*.md").to_string_lossy().into_owned();
 
     let paths: Vec<std::path::PathBuf> = glob::glob(&pattern)
         .map_err(|e| format!("glob pattern error: {e}"))?
@@ -661,7 +661,7 @@ pub fn import(repo_root: &Path) -> Result<(), String> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n != "template.md" && n != "NEXT.md")
+                .map(|n| n != "template.md" && n != "NEXT.md" && n != "README.md")
                 .unwrap_or(false)
         })
         .collect();
@@ -1305,6 +1305,37 @@ PR #42 merged and deployed.
 
         let store = Store::open(dir.path()).expect("open store");
         assert!(store.list_tickets().expect("list").is_empty());
+    }
+
+    #[test]
+    fn test_import_recurses_subdirectories() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sub_dir = dir
+            .path()
+            .join("docs")
+            .join("project")
+            .join("backlog")
+            .join("compiler");
+        fs::create_dir_all(&sub_dir).expect("create subdirectory");
+        fs::write(
+            sub_dir.join("batch1.md"),
+            "## Ticket SUB-1 — Nested ticket\n\
+             - Goal: Test recursive import\n\
+             - In scope:\n  - x\n\
+             - Out of scope:\n  - y\n\
+             - Dependencies: none\n\
+             - Acceptance criteria:\n  - pass\n\
+             - Verification:\n  - cargo test\n\
+             - Status: Done\n",
+        )
+        .expect("write nested backlog");
+
+        import(dir.path()).expect("import");
+
+        let store = Store::open(dir.path()).expect("open store");
+        let tickets = store.list_tickets().expect("list");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].ticket_id, "SUB-1");
     }
 
     // ── command integration tests ─────────────────────────────────────────────
