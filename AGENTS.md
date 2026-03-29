@@ -18,8 +18,8 @@ This is a standalone repository (`ottogiron/ticket-tracker`).
 
 - `src/main.rs` — CLI entry point
 - `src/lib.rs` — CLI struct, repo root resolution (`resolve_repo_root_from`), command router
-- `src/commands.rs` — command implementations (start, done, status, blocked, note)
-- `src/session.rs` — session lifecycle and I/O (`.sessions/` YAML files)
+- `src/commands.rs` — command implementations (start, done, status, reconcile, blocked, note)
+- `src/session.rs` — session lifecycle, reconciliation, and I/O (`.sessions/` YAML files)
 - `src/backlog.rs` — backlog file parsing, schema validation, and field manipulation
 
 ## Build Commands
@@ -55,7 +55,7 @@ This runs `fmt-check` + `clippy` + `test` + `lint-md`. All four checks must pass
 
 ### Session Storage
 
-Sessions are YAML files in `{repo_root}/.sessions/{TICKET_ID}.yaml`. Multiple sessions can be active concurrently. The pre-commit hook (in consumer repos) validates that at least one active session exists before allowing code commits.
+Sessions are YAML files in `{repo_root}/.sessions/{TICKET_ID}.yaml`. Multiple sessions can be active concurrently. `ticket reconcile` is the repo-side truth check for whether those sessions still match backlog reality. Consumer pre-commit hooks can use it to reject stale sessions.
 
 ### Backlog Files
 

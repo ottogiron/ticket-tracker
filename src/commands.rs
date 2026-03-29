@@ -1,4 +1,4 @@
-use crate::{Backlog, Session};
+use crate::{Backlog, DerivedStatus, ReconcileReport, Session};
 use chrono::Utc;
 use std::path::Path;
 
@@ -8,6 +8,138 @@ fn format_duration(duration: chrono::Duration) -> String {
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+fn status_label(status: &DerivedStatus) -> &'static str {
+    match status {
+        DerivedStatus::Active => "In Progress",
+        DerivedStatus::BatchActive => "Batch Active",
+        DerivedStatus::StaleDone => "Stale (Done in backlog)",
+        DerivedStatus::StaleBlocked => "Stale (Blocked in backlog)",
+        DerivedStatus::StatusMismatch => "Mismatch (Backlog status differs)",
+        DerivedStatus::MissingBacklog => "Invalid (Missing backlog file)",
+        DerivedStatus::MissingTicket => "Invalid (Missing ticket heading)",
+        DerivedStatus::InvalidSession => "Invalid session",
+    }
+}
+
+fn render_status(report: &ReconcileReport) -> String {
+    if report.sessions.is_empty() {
+        return "No active sessions\nRun 'ticket start <ticket-id>' to begin work.\n".to_string();
+    }
+
+    let mut output = String::new();
+    for (i, session) in report.sessions.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+
+        if session.mode == "batch" {
+            output.push_str(&format!("Batch: {}\n", session.ticket_id));
+            output.push_str("Mode: batch\n");
+        } else {
+            output.push_str(&format!("Ticket: {}\n", session.ticket_id));
+            output.push_str(&format!("Mode: {}\n", session.mode));
+        }
+
+        output.push_str(&format!(
+            "Status: {}\n",
+            status_label(&session.derived_status)
+        ));
+        if let Some(start) = session.start.as_ref() {
+            let elapsed = Utc::now() - *start;
+            output.push_str(&format!(
+                "Started: {}\n",
+                start.format("%Y-%m-%d %H:%M UTC")
+            ));
+            output.push_str(&format!("Elapsed: {}\n", format_duration(elapsed)));
+        }
+        output.push_str(&format!("File: {}\n", session.file.display()));
+        if let Some(backlog_status) = &session.backlog_status {
+            output.push_str(&format!("Backlog Status: {}\n", backlog_status));
+        }
+        if let Some(message) = &session.message {
+            output.push_str(&format!("Message: {}\n", message));
+        }
+    }
+
+    if report.sessions.len() > 1 {
+        output.push('\n');
+        output.push('\n');
+        output.push_str(&format!("{} active sessions\n", report.sessions.len()));
+    }
+
+    output
+}
+
+fn render_reconcile(report: &ReconcileReport) -> String {
+    if report.sessions.is_empty() {
+        return "No active sessions to reconcile.\n".to_string();
+    }
+
+    let mut output = String::new();
+    output.push_str("Session Reconciliation Summary\n");
+    output.push_str(&format!("  Total: {}\n", report.summary.total_sessions));
+    output.push_str(&format!("  Active: {}\n", report.summary.active));
+    output.push_str(&format!(
+        "  Batch Active: {}\n",
+        report.summary.batch_active
+    ));
+    output.push_str(&format!("  Stale Done: {}\n", report.summary.stale_done));
+    output.push_str(&format!(
+        "  Stale Blocked: {}\n",
+        report.summary.stale_blocked
+    ));
+    output.push_str(&format!(
+        "  Status Mismatch: {}\n",
+        report.summary.status_mismatch
+    ));
+    output.push_str(&format!(
+        "  Missing Backlog: {}\n",
+        report.summary.missing_backlog
+    ));
+    output.push_str(&format!(
+        "  Missing Ticket: {}\n",
+        report.summary.missing_ticket
+    ));
+    output.push_str(&format!(
+        "  Invalid Session: {}\n",
+        report.summary.invalid_session
+    ));
+
+    let problems: Vec<_> = report
+        .sessions
+        .iter()
+        .filter(|session| {
+            !matches!(
+                session.derived_status,
+                DerivedStatus::Active | DerivedStatus::BatchActive
+            )
+        })
+        .collect();
+
+    if problems.is_empty() {
+        output.push_str("\nAll sessions are consistent.\n");
+        return output;
+    }
+
+    output.push_str("\nProblems\n");
+    for session in problems {
+        output.push_str(&format!(
+            "- {} ({})\n",
+            session.ticket_id,
+            status_label(&session.derived_status)
+        ));
+        output.push_str(&format!("  File: {}\n", session.file.display()));
+        if let Some(backlog_status) = &session.backlog_status {
+            output.push_str(&format!("  Backlog Status: {}\n", backlog_status));
+        }
+        if let Some(message) = &session.message {
+            output.push_str(&format!("  Message: {}\n", message));
+        }
+    }
+
+    output
 }
 
 pub fn start(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
@@ -159,38 +291,27 @@ pub fn done(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
 }
 
 pub fn status(repo_root: &Path) -> Result<(), String> {
-    let sessions = Session::list_all(repo_root)?;
-
-    if sessions.is_empty() {
-        println!("No active sessions");
-        println!("Run 'ticket start <ticket-id>' to begin work.");
-        return Ok(());
-    }
-
-    for (i, session) in sessions.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        let elapsed = session.elapsed();
-        if session.mode == "batch" {
-            println!("Batch: {}", session.ticket_id);
-            println!("Mode: batch");
-        } else {
-            println!("Ticket: {}", session.ticket_id);
-            println!("Mode: ticket");
-        }
-        println!("Status: In Progress");
-        println!("Started: {}", session.start.format("%Y-%m-%d %H:%M UTC"));
-        println!("Elapsed: {}", format_duration(elapsed));
-        println!("File: {}", session.file.display());
-    }
-
-    if sessions.len() > 1 {
-        println!();
-        println!("{} active sessions", sessions.len());
-    }
-
+    let report = Session::reconcile_all(repo_root)?;
+    print!("{}", render_status(&report));
     Ok(())
+}
+
+pub fn reconcile(repo_root: &Path, json: bool) -> Result<(), String> {
+    let report = Session::reconcile_all(repo_root)?;
+
+    if json {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| format!("Failed to serialize reconcile report: {}", e))?;
+        println!("{}", json);
+    } else {
+        print!("{}", render_reconcile(&report));
+    }
+
+    if report.ok {
+        Ok(())
+    } else {
+        Err("Found stale or inconsistent sessions".to_string())
+    }
 }
 
 pub fn blocked(repo_root: &Path, ticket_id: &str, reason: &str) -> Result<(), String> {
@@ -227,4 +348,98 @@ pub fn note(repo_root: &Path, ticket_id: &str, note: &str) -> Result<(), String>
     println!("Note added to ticket {}", ticket_id);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ReconcileSummary, SessionDiagnostic};
+    use std::path::PathBuf;
+
+    fn report_with_session(session: SessionDiagnostic) -> ReconcileReport {
+        ReconcileReport {
+            ok: matches!(
+                session.derived_status,
+                DerivedStatus::Active | DerivedStatus::BatchActive
+            ),
+            summary: ReconcileSummary {
+                total_sessions: 1,
+                active: usize::from(matches!(session.derived_status, DerivedStatus::Active)),
+                batch_active: usize::from(matches!(
+                    session.derived_status,
+                    DerivedStatus::BatchActive
+                )),
+                stale_done: usize::from(matches!(session.derived_status, DerivedStatus::StaleDone)),
+                stale_blocked: usize::from(matches!(
+                    session.derived_status,
+                    DerivedStatus::StaleBlocked
+                )),
+                status_mismatch: usize::from(matches!(
+                    session.derived_status,
+                    DerivedStatus::StatusMismatch
+                )),
+                missing_backlog: usize::from(matches!(
+                    session.derived_status,
+                    DerivedStatus::MissingBacklog
+                )),
+                missing_ticket: usize::from(matches!(
+                    session.derived_status,
+                    DerivedStatus::MissingTicket
+                )),
+                invalid_session: usize::from(matches!(
+                    session.derived_status,
+                    DerivedStatus::InvalidSession
+                )),
+            },
+            sessions: vec![session],
+        }
+    }
+
+    #[test]
+    fn test_render_status_reports_stale_done() {
+        let output = render_status(&report_with_session(SessionDiagnostic {
+            ticket_id: "TEST-1".to_string(),
+            mode: "ticket".to_string(),
+            file: PathBuf::from("docs/project/backlog/test.md"),
+            start: None,
+            derived_status: DerivedStatus::StaleDone,
+            backlog_status: Some("Done".to_string()),
+            message: Some("Session is still open but ticket is Done in backlog".to_string()),
+        }));
+
+        assert!(output.contains("Status: Stale (Done in backlog)"));
+        assert!(output.contains("Backlog Status: Done"));
+    }
+
+    #[test]
+    fn test_render_reconcile_reports_consistent_sessions() {
+        let output = render_reconcile(&report_with_session(SessionDiagnostic {
+            ticket_id: "BATCH".to_string(),
+            mode: "batch".to_string(),
+            file: PathBuf::from("docs/project/backlog/test.md"),
+            start: None,
+            derived_status: DerivedStatus::BatchActive,
+            backlog_status: None,
+            message: None,
+        }));
+
+        assert!(output.contains("All sessions are consistent."));
+    }
+
+    #[test]
+    fn test_render_reconcile_reports_problem_details() {
+        let output = render_reconcile(&report_with_session(SessionDiagnostic {
+            ticket_id: "TEST-1".to_string(),
+            mode: "ticket".to_string(),
+            file: PathBuf::from("docs/project/backlog/test.md"),
+            start: None,
+            derived_status: DerivedStatus::MissingTicket,
+            backlog_status: None,
+            message: Some("Ticket TEST-1 not found".to_string()),
+        }));
+
+        assert!(output.contains("Problems"));
+        assert!(output.contains("TEST-1 (Invalid (Missing ticket heading))"));
+        assert!(output.contains("Message: Ticket TEST-1 not found"));
+    }
 }

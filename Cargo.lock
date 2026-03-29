@@ -580,6 +580,7 @@ dependencies = [
  "glob",
  "regex",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",

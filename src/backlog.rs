@@ -248,20 +248,26 @@ impl Backlog {
 
         let metrics_section_re = Regex::new(r"(?m)^## Execution Metrics\n")
             .map_err(|e| format!("Regex error: {}", e))?;
-
-        let insert_pos = if let Some(m) = metrics_section_re.find(&self.content) {
-            m.end()
-        } else {
-            let pos = self.content.len();
-            self.content.push_str("\n## Execution Metrics\n\n");
-            pos + 22
-        };
+        let next_section_re = Regex::new(r"(?m)^## ").map_err(|e| format!("Regex error: {}", e))?;
 
         let entry = format!(
             "- Ticket: {}\n- Owner: (pending)\n- Complexity: (pending)\n- Risk: (pending)\n- Start: (pending)\n- End: (pending)\n- Duration: (pending)\n- Notes: (pending)\n\n",
             ticket_id.to_uppercase()
         );
-        self.content.insert_str(insert_pos, &entry);
+
+        if let Some(m) = metrics_section_re.find(&self.content) {
+            let section_start = m.end();
+            let section_end = next_section_re
+                .find_at(&self.content, section_start)
+                .map(|next| next.start())
+                .unwrap_or(self.content.len());
+            let replacement = format!("\n{}", entry);
+            self.content
+                .replace_range(section_start..section_end, &replacement);
+        } else {
+            self.content.push_str("\n## Execution Metrics\n\n");
+            self.content.push_str(&entry);
+        }
 
         Ok(())
     }
@@ -421,6 +427,43 @@ mod tests {
         assert!(backlog
             .content
             .contains("- Notes: completed successfully\n\n- Ticket: TEST-2"));
+    }
+
+    #[test]
+    fn test_ensure_metrics_entry_inserts_after_blank_line() {
+        let content = ["## Execution Metrics", "", "## Closure Evidence", ""].join("\n");
+        let mut backlog = Backlog {
+            content,
+            file_path: std::path::PathBuf::from("unused.md"),
+        };
+
+        backlog
+            .ensure_metrics_entry("TEST-3")
+            .expect("ensure metrics entry");
+
+        assert!(backlog
+            .content
+            .contains("## Execution Metrics\n\n- Ticket: TEST-3"));
+    }
+
+    #[test]
+    fn test_ensure_metrics_entry_does_not_append_extra_blank_line() {
+        let content = ["## Execution Metrics", "", "## Closure Evidence", ""].join("\n");
+        let mut backlog = Backlog {
+            content,
+            file_path: std::path::PathBuf::from("unused.md"),
+        };
+
+        backlog
+            .ensure_metrics_entry("TEST-3")
+            .expect("ensure metrics entry");
+
+        assert!(backlog
+            .content
+            .contains("- Notes: (pending)\n\n## Closure Evidence"));
+        assert!(!backlog
+            .content
+            .contains("- Notes: (pending)\n\n\n## Closure Evidence"));
     }
 
     #[test]

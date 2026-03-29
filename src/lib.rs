@@ -6,7 +6,7 @@ pub mod commands;
 pub mod session;
 
 pub use backlog::Backlog;
-pub use session::Session;
+pub use session::{DerivedStatus, ReconcileReport, ReconcileSummary, Session, SessionDiagnostic};
 
 pub const SESSION_DIR: &str = ".sessions";
 pub const BACKLOG_DIR: &str = "docs/project/backlog";
@@ -104,6 +104,10 @@ enum Commands {
         batch: bool,
     },
     Status,
+    Reconcile {
+        #[arg(long, help = "Emit reconciliation results as JSON")]
+        json: bool,
+    },
     Blocked {
         #[arg(help = "Ticket ID (e.g., FLUX-123)")]
         ticket_id: String,
@@ -138,6 +142,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Commands::Status => commands::status(&repo_root),
+        Commands::Reconcile { json } => commands::reconcile(&repo_root, json),
         Commands::Blocked { ticket_id, reason } => {
             commands::blocked(&repo_root, &ticket_id, &reason)
         }

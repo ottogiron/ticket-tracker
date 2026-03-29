@@ -87,17 +87,28 @@ ticket done MY-BATCH --batch
 
 ### `ticket status`
 
-Shows all active sessions with elapsed time.
+Shows all active sessions with elapsed time and derived backlog-aware status labels.
 
 ```bash
 $ ticket status
 Batch: MY-BATCH
 Mode: batch
-Status: In Progress
+Status: Batch Active
 Started: 2026-03-14 14:23 UTC
 Elapsed: 01:30:00
 File: docs/project/backlog/my-batch.md
 ```
+
+### `ticket reconcile`
+
+Checks active sessions against backlog truth and reports stale or inconsistent sessions.
+
+```bash
+ticket reconcile
+ticket reconcile --json
+```
+
+Human-readable mode prints a summary plus any problematic sessions. `--json` emits structured diagnostics suitable for repo hooks or automation, and exits non-zero when stale or invalid sessions are found.
 
 ### `ticket blocked <id> "<reason>"`
 
@@ -207,6 +218,17 @@ ticket start ORCH-BATCH --batch
 ticket status
 # Shows both sessions
 ```
+
+### Session Reconciliation
+
+Session files are operator telemetry, not the source of truth for ticket progress. Backlog status remains authoritative.
+
+Use `ticket reconcile` to detect:
+
+- sessions left open after a ticket is marked `Done`
+- sessions pointing at missing backlog files
+- sessions whose ticket heading no longer exists
+- malformed session YAML
 
 ### Legacy Migration
 

@@ -1,4 +1,4 @@
-use crate::{BACKLOG_DIR, LEGACY_SESSION_FILE, SESSION_DIR};
+use crate::{Backlog, BACKLOG_DIR, LEGACY_SESSION_FILE, SESSION_DIR};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -11,6 +11,50 @@ pub struct Session {
     pub file: PathBuf,
     #[serde(default = "default_mode")]
     pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DerivedStatus {
+    Active,
+    BatchActive,
+    StaleDone,
+    StaleBlocked,
+    StatusMismatch,
+    MissingBacklog,
+    MissingTicket,
+    InvalidSession,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionDiagnostic {
+    pub ticket_id: String,
+    pub mode: String,
+    pub file: PathBuf,
+    pub start: Option<DateTime<Utc>>,
+    pub derived_status: DerivedStatus,
+    pub backlog_status: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct ReconcileSummary {
+    pub total_sessions: usize,
+    pub active: usize,
+    pub batch_active: usize,
+    pub stale_done: usize,
+    pub stale_blocked: usize,
+    pub status_mismatch: usize,
+    pub missing_backlog: usize,
+    pub missing_ticket: usize,
+    pub invalid_session: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub ok: bool,
+    pub sessions: Vec<SessionDiagnostic>,
+    pub summary: ReconcileSummary,
 }
 
 fn default_mode() -> String {
@@ -141,6 +185,168 @@ impl Session {
         Ok(sessions)
     }
 
+    fn resolve_backlog_path(repo_root: &Path, backlog_file: &Path) -> PathBuf {
+        if backlog_file.is_absolute() {
+            backlog_file.to_path_buf()
+        } else {
+            repo_root.join(backlog_file)
+        }
+    }
+
+    pub fn reconcile_all(repo_root: &Path) -> Result<ReconcileReport, String> {
+        Self::migrate_legacy(repo_root)?;
+
+        let dir = repo_root.join(SESSION_DIR);
+        if !dir.exists() {
+            return Ok(ReconcileReport {
+                ok: true,
+                sessions: Vec::new(),
+                summary: ReconcileSummary::default(),
+            });
+        }
+
+        let entries =
+            fs::read_dir(&dir).map_err(|e| format!("Failed to read sessions directory: {}", e))?;
+        let mut diagnostics = Vec::new();
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+            let session_path = entry.path();
+            if session_path.extension().is_none_or(|ext| ext != "yaml") {
+                continue;
+            }
+
+            let contents = fs::read_to_string(&session_path).map_err(|e| {
+                format!(
+                    "Failed to read session file {}: {}",
+                    session_path.display(),
+                    e
+                )
+            })?;
+
+            match serde_yaml::from_str::<Self>(&contents) {
+                Ok(session) => diagnostics.push(Self::diagnose_session(repo_root, session)),
+                Err(error) => {
+                    let ticket_id = session_path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("UNKNOWN")
+                        .to_uppercase();
+                    diagnostics.push(SessionDiagnostic {
+                        ticket_id,
+                        mode: "unknown".to_string(),
+                        file: session_path,
+                        start: None,
+                        derived_status: DerivedStatus::InvalidSession,
+                        backlog_status: None,
+                        message: Some(format!("Failed to parse session YAML: {}", error)),
+                    });
+                }
+            }
+        }
+
+        diagnostics.sort_by(|a, b| a.ticket_id.cmp(&b.ticket_id));
+
+        let mut summary = ReconcileSummary::default();
+        for diagnostic in &diagnostics {
+            summary.total_sessions += 1;
+            match diagnostic.derived_status {
+                DerivedStatus::Active => summary.active += 1,
+                DerivedStatus::BatchActive => summary.batch_active += 1,
+                DerivedStatus::StaleDone => summary.stale_done += 1,
+                DerivedStatus::StaleBlocked => summary.stale_blocked += 1,
+                DerivedStatus::StatusMismatch => summary.status_mismatch += 1,
+                DerivedStatus::MissingBacklog => summary.missing_backlog += 1,
+                DerivedStatus::MissingTicket => summary.missing_ticket += 1,
+                DerivedStatus::InvalidSession => summary.invalid_session += 1,
+            }
+        }
+
+        let ok = diagnostics.iter().all(|diagnostic| {
+            matches!(
+                diagnostic.derived_status,
+                DerivedStatus::Active | DerivedStatus::BatchActive
+            )
+        });
+
+        Ok(ReconcileReport {
+            ok,
+            sessions: diagnostics,
+            summary,
+        })
+    }
+
+    fn diagnose_session(repo_root: &Path, session: Self) -> SessionDiagnostic {
+        let backlog_path = Self::resolve_backlog_path(repo_root, &session.file);
+        if !backlog_path.exists() {
+            return SessionDiagnostic {
+                ticket_id: session.ticket_id,
+                mode: session.mode,
+                file: backlog_path,
+                start: Some(session.start),
+                derived_status: DerivedStatus::MissingBacklog,
+                backlog_status: None,
+                message: Some("Referenced backlog file does not exist".to_string()),
+            };
+        }
+
+        if session.mode == "batch" {
+            return SessionDiagnostic {
+                ticket_id: session.ticket_id,
+                mode: session.mode,
+                file: backlog_path,
+                start: Some(session.start),
+                derived_status: DerivedStatus::BatchActive,
+                backlog_status: None,
+                message: None,
+            };
+        }
+
+        match Backlog::read(&backlog_path)
+            .and_then(|backlog| backlog.get_status(&session.ticket_id))
+        {
+            Ok(status) => {
+                let (derived_status, message) = match status.as_str() {
+                    "In Progress" => (DerivedStatus::Active, None),
+                    "Done" => (
+                        DerivedStatus::StaleDone,
+                        Some("Session is still open but ticket is Done in backlog".to_string()),
+                    ),
+                    "Blocked" => (
+                        DerivedStatus::StaleBlocked,
+                        Some("Session is still open but ticket is Blocked in backlog".to_string()),
+                    ),
+                    other => (
+                        DerivedStatus::StatusMismatch,
+                        Some(format!(
+                            "Session is open but backlog status is '{}' instead of 'In Progress'",
+                            other
+                        )),
+                    ),
+                };
+
+                SessionDiagnostic {
+                    ticket_id: session.ticket_id,
+                    mode: session.mode,
+                    file: backlog_path,
+                    start: Some(session.start),
+                    derived_status,
+                    backlog_status: Some(status),
+                    message,
+                }
+            }
+            Err(error) => SessionDiagnostic {
+                ticket_id: session.ticket_id,
+                mode: session.mode,
+                file: backlog_path,
+                start: Some(session.start),
+                derived_status: DerivedStatus::MissingTicket,
+                backlog_status: None,
+                message: Some(error),
+            },
+        }
+    }
+
     pub fn write(&self, repo_root: &Path) -> Result<(), String> {
         Self::ensure_session_dir(repo_root)?;
         let session_path = Self::session_path(repo_root, &self.ticket_id);
@@ -216,6 +422,14 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn write_backlog(repo: &TempDir, name: &str, contents: &str) -> PathBuf {
+        let backlog_dir = repo.path().join(BACKLOG_DIR);
+        fs::create_dir_all(&backlog_dir).expect("create backlog dir");
+        let path = backlog_dir.join(name);
+        fs::write(&path, contents).expect("write backlog");
+        path
+    }
 
     #[test]
     fn test_find_backlog_file_respects_repo_root() {
@@ -315,5 +529,119 @@ mod tests {
     fn test_remove_nonexistent_is_ok() {
         let repo = TempDir::new().expect("create repo tempdir");
         Session::remove(repo.path(), "GHOST-1").expect("remove nonexistent should be ok");
+    }
+
+    #[test]
+    fn test_reconcile_all_reports_active_ticket_session() {
+        let repo = TempDir::new().expect("create repo tempdir");
+        let backlog = write_backlog(
+            &repo,
+            "sample.md",
+            "## Ticket TEST-1 — Sample\n- Status: In Progress\n",
+        );
+
+        Session::new("TEST-1", backlog)
+            .write(repo.path())
+            .expect("write session");
+
+        let report = Session::reconcile_all(repo.path()).expect("reconcile");
+        assert!(report.ok);
+        assert_eq!(report.summary.active, 1);
+        assert_eq!(report.sessions[0].derived_status, DerivedStatus::Active);
+    }
+
+    #[test]
+    fn test_reconcile_all_reports_done_ticket_as_stale() {
+        let repo = TempDir::new().expect("create repo tempdir");
+        let backlog = write_backlog(
+            &repo,
+            "sample.md",
+            "## Ticket TEST-1 — Sample\n- Status: Done\n",
+        );
+
+        Session::new("TEST-1", backlog)
+            .write(repo.path())
+            .expect("write session");
+
+        let report = Session::reconcile_all(repo.path()).expect("reconcile");
+        assert!(!report.ok);
+        assert_eq!(report.summary.stale_done, 1);
+        assert_eq!(report.sessions[0].derived_status, DerivedStatus::StaleDone);
+    }
+
+    #[test]
+    fn test_reconcile_all_reports_missing_backlog() {
+        let repo = TempDir::new().expect("create repo tempdir");
+        Session::new("TEST-1", PathBuf::from("docs/project/backlog/missing.md"))
+            .write(repo.path())
+            .expect("write session");
+
+        let report = Session::reconcile_all(repo.path()).expect("reconcile");
+        assert!(!report.ok);
+        assert_eq!(report.summary.missing_backlog, 1);
+        assert_eq!(
+            report.sessions[0].derived_status,
+            DerivedStatus::MissingBacklog
+        );
+    }
+
+    #[test]
+    fn test_reconcile_all_reports_missing_ticket_heading() {
+        let repo = TempDir::new().expect("create repo tempdir");
+        let backlog = write_backlog(
+            &repo,
+            "sample.md",
+            "## Ticket OTHER-1 — Sample\n- Status: In Progress\n",
+        );
+
+        Session::new("TEST-1", backlog)
+            .write(repo.path())
+            .expect("write session");
+
+        let report = Session::reconcile_all(repo.path()).expect("reconcile");
+        assert!(!report.ok);
+        assert_eq!(report.summary.missing_ticket, 1);
+        assert_eq!(
+            report.sessions[0].derived_status,
+            DerivedStatus::MissingTicket
+        );
+    }
+
+    #[test]
+    fn test_reconcile_all_reports_invalid_session_yaml() {
+        let repo = TempDir::new().expect("create repo tempdir");
+        let session_dir = repo.path().join(SESSION_DIR);
+        fs::create_dir_all(&session_dir).expect("create sessions dir");
+        fs::write(session_dir.join("BROKEN.yaml"), "ticket_id: [").expect("write broken session");
+
+        let report = Session::reconcile_all(repo.path()).expect("reconcile");
+        assert!(!report.ok);
+        assert_eq!(report.summary.invalid_session, 1);
+        assert_eq!(
+            report.sessions[0].derived_status,
+            DerivedStatus::InvalidSession
+        );
+    }
+
+    #[test]
+    fn test_reconcile_all_reports_batch_session_as_active() {
+        let repo = TempDir::new().expect("create repo tempdir");
+        let backlog = write_backlog(
+            &repo,
+            "batch.md",
+            "## Ticket BATCH-1 — Sample\n- Status: Todo\n",
+        );
+
+        Session::new_batch("BATCH", backlog)
+            .write(repo.path())
+            .expect("write session");
+
+        let report = Session::reconcile_all(repo.path()).expect("reconcile");
+        assert!(report.ok);
+        assert_eq!(report.summary.batch_active, 1);
+        assert_eq!(
+            report.sessions[0].derived_status,
+            DerivedStatus::BatchActive
+        );
     }
 }
