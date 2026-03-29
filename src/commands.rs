@@ -513,10 +513,12 @@ pub fn reconcile(repo_root: &Path, json: bool, strict: bool) -> Result<(), Strin
     }
 
     let success = if strict {
-        report
-            .sessions
-            .iter()
-            .all(|s| matches!(s.derived_status, DerivedStatus::Active))
+        report.sessions.iter().all(|s| {
+            matches!(
+                s.derived_status,
+                DerivedStatus::Active | DerivedStatus::BatchActive
+            )
+        })
     } else {
         report.ok
     };
@@ -1460,7 +1462,7 @@ PR #42 merged and deployed.
     }
 
     #[test]
-    fn test_reconcile_strict_fails_on_batch_session() {
+    fn test_reconcile_strict_passes_on_batch_session() {
         let repo = TempDir::new().expect("tempdir");
         let backlog_dir = repo.path().join(BACKLOG_DIR);
         fs::create_dir_all(&backlog_dir).expect("create backlog dir");
@@ -1471,8 +1473,7 @@ PR #42 merged and deployed.
         .expect("write");
         start_batch(repo.path(), "BATCH").expect("start batch");
 
-        let err = reconcile(repo.path(), false, true).expect_err("strict should fail");
-        assert!(err.contains("stale or inconsistent"));
+        reconcile(repo.path(), false, true).expect("strict should pass for batch sessions");
     }
 
     #[test]
