@@ -167,6 +167,73 @@ impl Store {
         Ok(is_new)
     }
 
+    /// Set `spec_file` for a ticket row only when it is currently `NULL`.
+    ///
+    /// Returns `true` if the row was updated, `false` if it already had a value
+    /// (or the ticket does not exist).
+    pub fn set_spec_file_if_null(&self, ticket_id: &str, spec_file: &str) -> Result<bool, String> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE tickets SET spec_file = ?1 WHERE ticket_id = ?2 AND spec_file IS NULL",
+                params![spec_file, ticket_id],
+            )
+            .map_err(|e| format!("set_spec_file_if_null failed: {e}"))?;
+        Ok(rows > 0)
+    }
+
+    /// One-shot idempotent data migration: for every ticket row whose `spec_file`
+    /// is `NULL` and whose `backlog` column holds an absolute path (written by
+    /// pre-fix versions of `start`, `blocked`, `note`, and YAML migration),
+    /// compute the repo-relative path and write it into `spec_file`.
+    ///
+    /// Rows where `backlog` is already a bare slug (no leading `/`) are skipped
+    /// because they were written by `ticket import` and are already correct.
+    ///
+    /// Returns the number of rows updated.
+    pub fn normalize_spec_files(&self, repo_root: &Path) -> Result<usize, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ticket_id, backlog FROM tickets \
+                 WHERE spec_file IS NULL AND backlog LIKE '/%'",
+            )
+            .map_err(|e| format!("prepare normalize_spec_files: {e}"))?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| format!("normalize_spec_files query: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("normalize_spec_files collect: {e}"))?;
+
+        let mut updated = 0;
+        for (ticket_id, backlog_abs) in rows {
+            let abs_path = std::path::Path::new(&backlog_abs);
+            match abs_path.strip_prefix(repo_root) {
+                Ok(rel) => {
+                    let rel_str = rel.to_string_lossy().into_owned();
+                    self.conn
+                        .execute(
+                            "UPDATE tickets SET spec_file = ?1 \
+                             WHERE ticket_id = ?2 AND spec_file IS NULL",
+                            params![rel_str, ticket_id],
+                        )
+                        .map_err(|e| format!("normalize_spec_files update: {e}"))?;
+                    updated += 1;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "warning: backlog path {} for ticket {} is not under repo root {}; skipping",
+                        backlog_abs,
+                        ticket_id,
+                        repo_root.display()
+                    );
+                }
+            }
+        }
+
+        Ok(updated)
+    }
+
     /// Return `true` when a note with identical `(ticket_id, kind, body)`
     /// already exists.  Used by the import command to avoid duplicates.
     pub fn note_exists(&self, ticket_id: &str, kind: &str, body: &str) -> Result<bool, String> {
@@ -872,5 +939,120 @@ mod tests {
         assert!(!store
             .note_exists("FLUX-1", "other", "my note")
             .expect("exists other"));
+    }
+
+    // ── set_spec_file_if_null ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_spec_file_if_null_updates_null_row() {
+        let (_dir, store) = make_store();
+        store.insert_ticket(&sample_ticket()).expect("insert");
+        let updated = store
+            .set_spec_file_if_null("FLUX-1", "docs/backlog/project.md")
+            .expect("set");
+        assert!(updated, "should update a row with NULL spec_file");
+        let got = store.get_ticket("FLUX-1").expect("get").expect("some");
+        assert_eq!(got.spec_file.as_deref(), Some("docs/backlog/project.md"));
+    }
+
+    #[test]
+    fn test_set_spec_file_if_null_skips_populated_row() {
+        let (_dir, store) = make_store();
+        store
+            .insert_ticket(&Ticket {
+                spec_file: Some("docs/backlog/existing.md".to_string()),
+                ..sample_ticket()
+            })
+            .expect("insert");
+        let updated = store
+            .set_spec_file_if_null("FLUX-1", "docs/backlog/other.md")
+            .expect("set");
+        assert!(!updated, "should not overwrite an existing spec_file");
+        let got = store.get_ticket("FLUX-1").expect("get").expect("some");
+        assert_eq!(
+            got.spec_file.as_deref(),
+            Some("docs/backlog/existing.md"),
+            "original spec_file must be preserved"
+        );
+    }
+
+    // ── normalize_spec_files ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_spec_files_converts_absolute_backlog() {
+        let (dir, store) = make_store();
+        // Simulate a pre-fix row: backlog holds the absolute path, spec_file is NULL.
+        let abs_path = dir
+            .path()
+            .join("docs/project/backlog/project.md")
+            .to_string_lossy()
+            .into_owned();
+        store
+            .insert_ticket(&Ticket {
+                backlog: abs_path,
+                spec_file: None,
+                ..sample_ticket()
+            })
+            .expect("insert");
+
+        let count = store.normalize_spec_files(dir.path()).expect("normalize");
+        assert_eq!(count, 1);
+
+        let got = store.get_ticket("FLUX-1").expect("get").expect("some");
+        assert_eq!(
+            got.spec_file.as_deref(),
+            Some("docs/project/backlog/project.md")
+        );
+    }
+
+    #[test]
+    fn test_normalize_spec_files_idempotent() {
+        let (dir, store) = make_store();
+        let abs_path = dir
+            .path()
+            .join("docs/project/backlog/project.md")
+            .to_string_lossy()
+            .into_owned();
+        store
+            .insert_ticket(&Ticket {
+                backlog: abs_path,
+                spec_file: None,
+                ..sample_ticket()
+            })
+            .expect("insert");
+
+        store.normalize_spec_files(dir.path()).expect("first run");
+        let count2 = store.normalize_spec_files(dir.path()).expect("second run");
+        assert_eq!(count2, 0, "second run must find nothing to migrate");
+    }
+
+    #[test]
+    fn test_normalize_spec_files_skips_slug_rows() {
+        let (dir, store) = make_store();
+        // Rows written by `ticket import` have a bare slug — must not be touched.
+        store.insert_ticket(&sample_ticket()).expect("insert"); // backlog = "project"
+        let count = store.normalize_spec_files(dir.path()).expect("normalize");
+        assert_eq!(count, 0, "slug rows must be left unchanged");
+        let got = store.get_ticket("FLUX-1").expect("get").expect("some");
+        assert!(got.spec_file.is_none());
+    }
+
+    #[test]
+    fn test_normalize_spec_files_skips_already_populated() {
+        let (dir, store) = make_store();
+        let abs_path = dir
+            .path()
+            .join("docs/project/backlog/project.md")
+            .to_string_lossy()
+            .into_owned();
+        store
+            .insert_ticket(&Ticket {
+                backlog: abs_path,
+                spec_file: Some("docs/project/backlog/already.md".to_string()),
+                ..sample_ticket()
+            })
+            .expect("insert");
+        let count = store.normalize_spec_files(dir.path()).expect("normalize");
+        assert_eq!(count, 0, "already-populated rows must not be updated");
     }
 }

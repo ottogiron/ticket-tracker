@@ -29,6 +29,26 @@ fn status_label(status: &DerivedStatus) -> &'static str {
     }
 }
 
+fn backlog_slug(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn spec_file_rel(abs_path: &Path, repo_root: &Path) -> Result<String, String> {
+    abs_path
+        .strip_prefix(repo_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|_| {
+            format!(
+                "backlog file {} is not under repo root {}",
+                abs_path.display(),
+                repo_root.display()
+            )
+        })
+}
+
 fn render_status(report: &ReconcileReport) -> String {
     if report.sessions.is_empty() {
         return "No active sessions\nRun 'ticket start <ticket-id>' to begin work.\n".to_string();
@@ -162,6 +182,7 @@ fn open_store_with_migration(repo_root: &Path) -> Result<store::Store, String> {
     };
 
     let store = store::Store::open(repo_root)?;
+    store.normalize_spec_files(repo_root)?;
 
     if !yaml_sessions.is_empty() {
         eprintln!(
@@ -169,14 +190,21 @@ fn open_store_with_migration(repo_root: &Path) -> Result<store::Store, String> {
             yaml_sessions.len()
         );
         for session in &yaml_sessions {
-            let backlog_str = session.file.to_string_lossy().into_owned();
+            let slug = backlog_slug(&session.file);
+            let sf = match spec_file_rel(&session.file, repo_root) {
+                Ok(rel) => Some(rel),
+                Err(e) => {
+                    eprintln!("warning: {e}");
+                    None
+                }
+            };
             let ts = session.start.timestamp();
             if store.get_ticket(&session.ticket_id)?.is_none() {
                 store.insert_ticket(&store::Ticket {
                     ticket_id: session.ticket_id.clone(),
-                    backlog: backlog_str,
+                    backlog: slug,
                     title: session.ticket_id.clone(),
-                    spec_file: None,
+                    spec_file: sf,
                     created_at: ts,
                 })?;
             }
@@ -197,7 +225,12 @@ fn reconcile_from_store(store: &store::Store, repo_root: &Path) -> Result<Reconc
     for session in &sessions {
         let backlog_path = store
             .get_ticket(&session.ticket_id)?
-            .map(|t| PathBuf::from(&t.backlog))
+            .map(|t| {
+                t.spec_file
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&t.backlog))
+            })
             .unwrap_or_else(|| PathBuf::from(format!("unknown/{}.md", session.ticket_id)));
 
         let start = chrono::DateTime::from_timestamp(session.started_at, 0);
@@ -328,16 +361,19 @@ pub fn start(repo_root: &Path, ticket_id: &str) -> Result<(), String> {
 
     let now = Utc::now();
     let now_ts = now.timestamp();
-    let backlog_str = backlog_path.to_string_lossy().into_owned();
+    let slug = backlog_slug(&backlog_path);
+    let sf = spec_file_rel(&backlog_path, repo_root)?;
 
     if store.get_ticket(&ticket_id)?.is_none() {
         store.insert_ticket(&store::Ticket {
             ticket_id: ticket_id.clone(),
-            backlog: backlog_str,
+            backlog: slug,
             title: ticket_id.clone(),
-            spec_file: None,
+            spec_file: Some(sf.clone()),
             created_at: now_ts,
         })?;
+    } else {
+        store.set_spec_file_if_null(&ticket_id, &sf)?;
     }
 
     store.upsert_ticket_status(&store::TicketStatus {
@@ -383,16 +419,19 @@ pub fn start_batch(repo_root: &Path, batch_id: &str) -> Result<(), String> {
 
     let now = Utc::now();
     let now_ts = now.timestamp();
-    let backlog_str = backlog_path.to_string_lossy().into_owned();
+    let slug = backlog_slug(&backlog_path);
+    let sf = spec_file_rel(&backlog_path, repo_root)?;
 
     if store.get_ticket(&batch_id)?.is_none() {
         store.insert_ticket(&store::Ticket {
             ticket_id: batch_id.clone(),
-            backlog: backlog_str,
+            backlog: slug,
             title: format!("Batch: {}", batch_id),
-            spec_file: None,
+            spec_file: Some(sf.clone()),
             created_at: now_ts,
         })?;
+    } else {
+        store.set_spec_file_if_null(&batch_id, &sf)?;
     }
 
     store.insert_session(&batch_id, "batch", None, now_ts)?;
@@ -542,14 +581,19 @@ pub fn blocked(repo_root: &Path, ticket_id: &str, reason: &str) -> Result<(), St
 
     if store.get_ticket(&ticket_id)?.is_none() {
         let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
-        let backlog_str = backlog_path.to_string_lossy().into_owned();
+        let slug = backlog_slug(&backlog_path);
+        let sf = spec_file_rel(&backlog_path, repo_root)?;
         store.insert_ticket(&store::Ticket {
             ticket_id: ticket_id.clone(),
-            backlog: backlog_str,
+            backlog: slug,
             title: ticket_id.clone(),
-            spec_file: None,
+            spec_file: Some(sf),
             created_at: now_ts,
         })?;
+    } else {
+        let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
+        let sf = spec_file_rel(&backlog_path, repo_root)?;
+        store.set_spec_file_if_null(&ticket_id, &sf)?;
     }
 
     let started_at = store
@@ -588,14 +632,19 @@ pub fn note(repo_root: &Path, ticket_id: &str, note: &str) -> Result<(), String>
 
     if store.get_ticket(&ticket_id)?.is_none() {
         let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
-        let backlog_str = backlog_path.to_string_lossy().into_owned();
+        let slug = backlog_slug(&backlog_path);
+        let sf = spec_file_rel(&backlog_path, repo_root)?;
         store.insert_ticket(&store::Ticket {
             ticket_id: ticket_id.clone(),
-            backlog: backlog_str,
+            backlog: slug,
             title: ticket_id.clone(),
-            spec_file: None,
+            spec_file: Some(sf),
             created_at: now_ts,
         })?;
+    } else {
+        let backlog_path = Session::find_backlog_file(repo_root, &ticket_id)?;
+        let sf = spec_file_rel(&backlog_path, repo_root)?;
+        store.set_spec_file_if_null(&ticket_id, &sf)?;
     }
 
     store.add_note(&ticket_id, "comment", note, now_ts)?;
@@ -1227,6 +1276,10 @@ PR #42 merged and deployed.
         let t1 = store.get_ticket("IMP-1").expect("get").expect("some");
         assert_eq!(t1.backlog, "project");
         assert_eq!(t1.title, "First ticket");
+        assert_eq!(
+            t1.spec_file.as_deref(),
+            Some("docs/project/backlog/project.md")
+        );
 
         let s1 = store
             .get_ticket_status("IMP-1")
@@ -1485,6 +1538,60 @@ PR #42 merged and deployed.
     }
 
     #[test]
+    fn test_blocked_fills_spec_file_on_existing_row_with_null() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        {
+            let store = store::Store::open(repo.path()).expect("open store");
+            store
+                .insert_ticket(&store::Ticket {
+                    ticket_id: "TEST-1".to_string(),
+                    backlog: "test".to_string(),
+                    title: "TEST-1".to_string(),
+                    spec_file: None,
+                    created_at: 1_000_000,
+                })
+                .expect("seed ticket");
+        }
+        blocked(repo.path(), "TEST-1", "waiting for dep").expect("blocked");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let ticket = store.get_ticket("TEST-1").expect("get").expect("some");
+        assert_eq!(
+            ticket.spec_file.as_deref(),
+            Some("docs/project/backlog/test.md"),
+            "blocked must backfill spec_file on existing NULL row"
+        );
+    }
+
+    #[test]
+    fn test_note_fills_spec_file_on_existing_row_with_null() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        {
+            let store = store::Store::open(repo.path()).expect("open store");
+            store
+                .insert_ticket(&store::Ticket {
+                    ticket_id: "TEST-1".to_string(),
+                    backlog: "test".to_string(),
+                    title: "TEST-1".to_string(),
+                    spec_file: None,
+                    created_at: 1_000_000,
+                })
+                .expect("seed ticket");
+        }
+        note(repo.path(), "TEST-1", "edge case found").expect("note");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let ticket = store.get_ticket("TEST-1").expect("get").expect("some");
+        assert_eq!(
+            ticket.spec_file.as_deref(),
+            Some("docs/project/backlog/test.md"),
+            "note must backfill spec_file on existing NULL row"
+        );
+    }
+
+    #[test]
     fn test_reconcile_active_session_is_ok() {
         let repo = TempDir::new().expect("tempdir");
         make_backlog_ticket(&repo, "TEST-1", "Todo");
@@ -1628,5 +1735,118 @@ PR #42 merged and deployed.
 
         // report --batch BATCH should list all three tickets without error.
         report(repo.path(), None, Some("BATCH")).expect("batch report");
+    }
+
+    // ── spec_file write-path tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_start_writes_slug_and_spec_file() {
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        start(repo.path(), "TEST-1").expect("start");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let ticket = store.get_ticket("TEST-1").expect("get").expect("some");
+        assert_eq!(ticket.backlog, "test", "backlog must be the bare file stem");
+        assert_eq!(
+            ticket.spec_file.as_deref(),
+            Some("docs/project/backlog/test.md"),
+            "spec_file must be the repo-relative path"
+        );
+    }
+
+    #[test]
+    fn test_start_fills_spec_file_on_existing_row_with_null() {
+        // Simulate a row inserted by an older code path (spec_file = NULL).
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+        {
+            let store = store::Store::open(repo.path()).expect("open store");
+            store
+                .insert_ticket(&store::Ticket {
+                    ticket_id: "TEST-1".to_string(),
+                    backlog: "test".to_string(),
+                    title: "TEST-1".to_string(),
+                    spec_file: None,
+                    created_at: 1_000_000,
+                })
+                .expect("seed ticket");
+        }
+        start(repo.path(), "TEST-1").expect("start");
+
+        let store = store::Store::open(repo.path()).expect("open store");
+        let ticket = store.get_ticket("TEST-1").expect("get").expect("some");
+        assert_eq!(
+            ticket.spec_file.as_deref(),
+            Some("docs/project/backlog/test.md"),
+            "start must backfill spec_file on existing NULL row"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_uses_spec_file_from_import() {
+        // Reproduces the original bug: import writes slug into backlog + relative
+        // path into spec_file; reconcile --strict must succeed without
+        // "Missing backlog file".
+        let repo = TempDir::new().expect("tempdir");
+        make_backlog_ticket(&repo, "TEST-1", "Todo");
+
+        // import populates the ticket row with the correct slug + spec_file.
+        import(repo.path()).expect("import");
+
+        // start creates a session; the ticket row already exists from import.
+        start(repo.path(), "TEST-1").expect("start");
+
+        // Verify the ticket row has a bare slug (no path separator).
+        let store = store::Store::open(repo.path()).expect("open store");
+        let ticket = store.get_ticket("TEST-1").expect("get").expect("some");
+        assert!(
+            !ticket.backlog.contains('/'),
+            "backlog must be a bare slug, got: {}",
+            ticket.backlog
+        );
+        assert!(
+            ticket.spec_file.is_some(),
+            "spec_file must be set after import"
+        );
+        drop(store);
+
+        // Strict reconcile must pass — the original bug caused MissingBacklog here.
+        reconcile(repo.path(), false, true).expect("strict reconcile must succeed");
+    }
+
+    #[test]
+    fn test_normalize_spec_files_called_on_open_store() {
+        // Seed a pre-fix row (absolute backlog path, NULL spec_file).
+        let repo = TempDir::new().expect("tempdir");
+        {
+            let store = store::Store::open(repo.path()).expect("open store");
+            let abs_backlog = repo
+                .path()
+                .join("docs/project/backlog/test.md")
+                .to_string_lossy()
+                .into_owned();
+            store
+                .insert_ticket(&store::Ticket {
+                    ticket_id: "TEST-1".to_string(),
+                    backlog: abs_backlog,
+                    title: "TEST-1".to_string(),
+                    spec_file: None,
+                    created_at: 1_000_000,
+                })
+                .expect("seed");
+        }
+
+        // Calling normalize_spec_files directly simulates what
+        // open_store_with_migration does on next command invocation.
+        let store = store::Store::open(repo.path()).expect("re-open store");
+        store.normalize_spec_files(repo.path()).expect("normalize");
+
+        let ticket = store.get_ticket("TEST-1").expect("get").expect("some");
+        assert_eq!(
+            ticket.spec_file.as_deref(),
+            Some("docs/project/backlog/test.md"),
+            "normalize_spec_files must have backfilled spec_file"
+        );
     }
 }
